@@ -1,0 +1,21 @@
+Let’s implement Module 2 (NativeCaptureEngine).
+This is the most critical component for achieving high-performance tracking. We will use JNA (Java Native Access) to bypass the slow, heavy memory footprint of standard Java tools. Instead of creating new image objects on every frame, this implementation hooks directly into the Windows GDI API via User32.dll and GDI32.dll to copy the screen pixels straight into a pre-allocated, recycled byte buffer in our EdokitImage. [1] 
+Please implement the complete, optimized code for edokit.base.capture.NativeCaptureEngine using the following exact specifications:
+## 📋 Technical Constraints for Module 2:
+
+   1. Target Window Resolution: Use the Windows API to find the window handle (HWND) matching the title "RuneScape".
+   2. Zero-Allocation Hot Path: The capture loop must use a reusable byte[] buffer. Do not initialize new arrays or BufferedImage objects inside the capture tick loop.
+   3. GDI Win32 Pipeline: Replicate Alt1's desktop capture technique by chaining:
+   * GetWindowRect to get exact client bounds.
+      * GetDC / CreateCompatibleDC to establish a memory graphics context.
+      * CreateCompatibleBitmap / SelectObject to allocate a GDI bitmap handle.
+      * BitBlt to copy the window pixels rapidly on the GPU/OS level.
+      * GetDIBits to extract the raw pixel blocks directly out of unmanaged memory straight into our pre-allocated EdokitImage data array. [2] 
+   4. Color Correction Alignment: Ensure the bitmap structure configuration (BITMAPINFOHEADER) targets a standard 32-bit layout so it maps perfectly to our interleaved RGBA data array sequence.
+   5. Proper Cleanup: Implement an explicit close() or release() method to free the unmanaged context handles (ReleaseDC, DeleteDC, DeleteObject) to prevent dangerous native Windows memory leaks. [3] 
+
+Let's see the complete code implementation for NativeCaptureEngine!
+
+[1] [https://imagej.net](https://imagej.net/develop/native-libraries)
+[2] [https://forums.codeguru.com](https://forums.codeguru.com/showthread.php?258701-Should-ReleaseDC%28%29-after-each-GetDC%28%29)
+[3] [https://dev.to](https://dev.to/amitkumar13/memory-leak-detection-in-react-native-with-leakcanary-166o)
