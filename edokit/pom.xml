@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.edokit</groupId>
+    <artifactId>edokit</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>Edokit</name>
+    <description>
+        A fast, native Java alternative to the Alt1 Toolkit for RuneScape interface detection.
+        Provides high-performance image capture, pixel access, and template matching pipelines.
+    </description>
+
+    <properties>
+        <java.version>17</java.version>
+        <maven.compiler.source>${java.version}</maven.compiler.source>
+        <maven.compiler.target>${java.version}</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!-- Dependency versions -->
+        <jna.version>5.14.0</jna.version>
+        <opencv.version>4.9.0-0</opencv.version>
+    </properties>
+
+    <dependencies>
+
+        <!-- ================================================================
+             Java Native Access (JNA)
+             Used for Windows API hooks: window enumeration, BitBlt screen
+             capture, HWND resolution, and low-level GDI calls.
+        ================================================================ -->
+        <dependency>
+            <groupId>net.java.dev.jna</groupId>
+            <artifactId>jna</artifactId>
+            <version>${jna.version}</version>
+        </dependency>
+
+        <!-- JNA Platform — pre-mapped Win32/POSIX structures (HWND, HDC, etc.) -->
+        <dependency>
+            <groupId>net.java.dev.jna</groupId>
+            <artifactId>jna-platform</artifactId>
+            <version>${jna.version}</version>
+        </dependency>
+
+        <!-- ================================================================
+             OpenCV Java Bindings
+             Used for Mat-backed native image buffers, template matching
+             (matchTemplate), and future CV pipeline steps.
+             The openpnp bundle includes the platform-native .so/.dll.
+        ================================================================ -->
+        <dependency>
+            <groupId>org.openpnp</groupId>
+            <artifactId>opencv</artifactId>
+            <version>${opencv.version}</version>
+        </dependency>
+
+    </dependencies>
+
+    <build>
+        <plugins>
+
+            <!-- ============================================================
+                 Maven Compiler Plugin
+                 Targets Java 17 with full preview-feature support enabled.
+                 Incremental compilation is on by default via useIncrementalCompilation.
+            ============================================================ -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <source>${java.version}</source>
+                    <target>${java.version}</target>
+                    <release>${java.version}</release>
+                    <encoding>${project.build.sourceEncoding}</encoding>
+                    <!--
+                        Enable all lint warnings during compilation so that
+                        performance-sensitive code (unchecked casts, raw types,
+                        deprecations) surfaces early.
+                    -->
+                    <compilerArgs>
+                        <arg>-Xlint:all</arg>
+                        <arg>-Xlint:-processing</arg>
+                    </compilerArgs>
+                </configuration>
+            </plugin>
+
+            <!-- ============================================================
+                 Maven Jar Plugin
+                 Produces a thin jar; fat-jar / shading is intentionally
+                 deferred until a launcher module is added.
+            ============================================================ -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.1</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
+                            <addDefaultSpecificationEntries>true</addDefaultSpecificationEntries>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+
+        </plugins>
+    </build>
+
+</project>
