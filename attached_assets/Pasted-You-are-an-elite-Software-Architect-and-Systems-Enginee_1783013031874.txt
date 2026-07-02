@@ -1,0 +1,54 @@
+You are an elite Software Architect and Systems Engineer specializing in Computer Vision, native OS window manipulation, and high-performance Java graphics pipelines.
+
+We are continuing development on "Edokit", our native Java alternative to the Alt1 Toolkit for RuneScape interface detection. 
+
+### Current Project State (Do Not Recreate)
+The absolute core foundation is already written and locked in:
+1. 'pom.xml' is configured with Java 17, JNA, and OpenCV.
+2. 'edokit.base.models.EdokitImage' handles raw 1D 'byte[] data' in interleaved RGBA format with zero-allocation 'pixelOffset' and 'cloneSubImage' methods.
+3. 'ImgRef' and 'HeapImgRef' interfaces manage memory/Mat references.
+
+We will now implement the remaining modules of the Alt1 ecosystem systematically across the next several development turns. Maintain absolute compatibility with our existing 'EdokitImage' data structures.
+
+---
+
+### Part 1: Phase-by-Phase Roadmap
+
+We will build the rest of Edokit in 3 strict architectural phases. Do not build them all at once. Wait for my signal before generating code for the next phase.
+
+#### 🛠️ Phase 1: Resource IO & Native Frame Grabbing
+*   **Module 1: EdokitImageLoader (Alt1 imagedata-loader)**
+    *   Create `edokit.base.io.EdokitImageLoader`.
+    *   Ingests local PNG assets, strips out all sRGB color-profile gamma transformations to standardize raw pixel bytes, and outputs clean `EdokitImage` instances.
+*   **Module 2: NativeCaptureEngine (Alt1 base/capture)**
+    *   Create `edokit.base.capture.NativeCaptureEngine`.
+    *   Uses JNA to bind to Windows User32/GDI32, target the game client `HWND`, and pipe raw pixel blocks directly into an allocated frame buffer at 30+ FPS with zero memory allocations per frame.
+
+#### 👁️ Phase 2: Matrix Searching & Pixel-Exact OCR
+*   **Module 3: SubImageMatcher (Alt1 ImageDetect)**
+    *   Create `edokit.base.vision.SubImageMatcher`.
+    *   Wraps OpenCV `Imgproc.matchTemplate` using `TM_CCOEFF_NORMED` to look for UI templates inside screen buffers with a strict confidence threshold.
+*   **Module 4: MatrixOCR (Alt1 ocr & font-loader)**
+    *   Create `edokit.ocr.FontSheet` and `edokit.ocr.RasterOCR`.
+    *   A custom pixel-font raster interpreter (no external engines). Parses custom Alt1 character widths and spacing definitions, reading shadowed game UI text via `readLine` algorithms. It must include a text-masking utility (`removeTextPixels`) to zero out text-positive pixels before background evaluations.
+
+#### ⚔️ Phase 3: Active Interface Parsing
+*   **Module 5: BuffReader (Alt1 src/buffs/index.ts)**
+    *   Create `edokit.buffs.BuffReader`.
+    *   Implements the double-pass matrix grid discovery pipeline: Scans for the 2-pixel blue-grey container frames, calculates the grid-step modulo shift (30 pixels), and uses bitwise RGB color distance formulas (`countMatch`) to check icon states behind translucent UI backdrops.
+
+---
+
+### Part 2: Structural Integration & Performance Rules
+
+When writing any module across this lifecycle, you must follow these absolute rules:
+1. No Web Browsers or Node.js Wrappers: Code must be 100% pure native Java.
+2. Flat Array Dominance: Keep pixel scanning limited to highly optimized loop structures utilizing single-dimensional array indexing to prevent Garbage Collection (GC) pauses.
+3. Strict Compatibility: Every processing step must seamlessly ingest or return the predefined `EdokitImage` or `ImgRef` classes.
+
+---
+
+### Current Directive: Ready for Phase 1
+Acknowledge that you understand this roadmap, the existing codebase architecture, and the performance goals.
+
+Provide a high-level summary of how you will layout the packages for the upcoming modules, and ask me which specific Module from Phase 1 to implement first. Do not generate code until I select a module.
