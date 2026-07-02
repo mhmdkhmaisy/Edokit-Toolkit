@@ -1,0 +1,58 @@
+You are an elite Performance Engineer and Graphics Software Architect. We are continuing Phase 2 of Edokit. Your task is to implement Module 4: MatrixOCR, consisting of two foundational classes: 'edokit.ocr.FontSheet' and 'edokit.ocr.RasterOCR'.
+
+This must be a custom, pixel-exact raster OCR engine built specifically to parse RuneScape's unique unblended, shadowed interface fonts. Do not use generic software like Tesseract. Replicate the core programmatic approach used by Alt1's font-loader and ocr modules, supporting its native .fontmeta.json definitions and uncompressed data.png font sheets.
+
+Please write clean, production-ready Java code matching the following technical specifications:
+
+---
+
+### Specification 1: 'edokit.ocr.FontSheet' (Complete Metadata Parser)
+This class dynamically reads and holds both the visual glyph images and structural properties defined by Alt1 font schemas (such as 'pixel_8px_digits', 'aa_8px', 'aa_12px_mono').
+
+1. Schema Capabilities:
+   The JSON parser (using Jackson or GSON) must handle ALL possible property definitions present across Alt1's font specification assets:
+   - "fontname": String identifier of the font.
+   - "basey": Base vertical offset used for character line baseline alignment.
+   - "lineheight": Step delta for multi-line block parsing.
+   - "space_width": Integer fallback value for space (' ') string separations.
+   - "glyphs": An array or object map of character bounding objects containing:
+     * "ch": The string representation of the target character.
+     * "id": Integer index assignment.
+     * "x" / "y": Origin top-left tracking positions within the source data image.
+     * "width" / "height": Strict box bounding box parameters for slicing.
+     * "advx": Horizontal advance distance (used to jump to the next letter).
+
+2. Structural Layout:
+   - Fields:
+     * 'public final EdokitImage fontImage;' // Loaded via EdokitImageLoader
+     * 'private final Map<Character, GlyphDefinition> glyphMap;'
+     * 'public final int baseY;'
+     * 'public final int spaceWidth;'
+   - Create a nested helper 'record GlyphDefinition(int x, int y, int width, int height, int advX)'.
+   - Add a static factory constructor: 'public static FontSheet load(InputStream jsonStream, InputStream imgStream)'.
+
+---
+
+### Specification 2: 'edokit.ocr.RasterOCR' (The Scanning Engine)
+This class handles text extraction and image preparation loops directly on raw pixel arrays.
+
+1. Method: 'public String readLine(EdokitImage source, int startX, int startY, FontSheet font, int maxColorDistance)'
+   - Iterates horizontally across the source frame slice, checking for matching templates in the font's 'glyphMap'.
+   - Implement Alt1's specific 'coldif' (color difference) metrics: loop pixel-by-pixel over the candidate glyph's width and height box.
+   - For every pixel in the font template that is NOT transparent/empty alpha, compute the absolute RGB variance against the target source screen pixel:
+     int deltaR = Math.abs(fontR - srcR);
+     int deltaG = Math.abs(fontG - srcG);
+     int deltaB = Math.abs(fontB - srcB);
+   - A glyph matches if ALL non-transparent pixels fall beneath 'maxColorDistance'.
+   - Proportional Spacing: Upon a successful match, advance the cursor coordinate index horizontally by the tracked character's specific 'advX' value. If no glyph matches, advance by 1 pixel to test the next slice.
+
+2. Method: 'public void removeTextPixels(EdokitImage source, int startX, int startY, String verifiedText, FontSheet font)'
+   - This implements Alt1's mask technique. Once text (like a yellow countdown timer) is read, this method steps back through the bounding coordinates of that string.
+   - For every positive, visible pixel forming the character shapes, overwrite the matching coordinates inside the 'source' byte array to pure black (RGBA = 0, 0, 0, 0).
+   - This strips the overlay, preventing the numbers from distorting color sampling checks executed by downstream buff-detection routines.
+
+---
+
+### Performance Rules:
+- Enforce standard loop unrolling or simple flat array tracking logic using 'pixelOffset' on 'EdokitImage'.
+- Do not instantiate new object variables inside the pixel checking nested for-loops. Recycle primitives.
