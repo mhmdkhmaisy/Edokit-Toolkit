@@ -1,0 +1,69 @@
+You are an elite Software Architect and Systems Engineer specializing in Computer Vision and high-performance native Java graphics pipelines. We are building "Edokit", a fast, native Java alternative to the Alt1 Toolkit for RuneScape interface detection.
+
+### Context Catch-Up (New Session)
+We are in the middle of Phase 2 of our project. The preceding system architecture and modules are fully locked in:
+1. 'pom.xml' is set up with Java 17, JNA, and OpenCV.
+2. 'edokit.base.models.EdokitImage' handles raw 1D 'byte[] data' in interleaved RGBA format with zero-allocation 'pixelOffset' and 'cloneSubImage' methods.
+3. 'ImgRef' and 'HeapImgRef' handle image reference routing.
+4. 'EdokitImageLoader' handles resource loading while stripping out structural sRGB gamma profiles.
+5. 'NativeCaptureEngine' runs a zero-allocation GDI capture loop at 30+ FPS via JNA.
+6. 'SubImageMatcher' handles OpenCV template searches.
+
+### Current Task: Verification and Completion of Module 4 (MatrixOCR)
+The classes 'edokit.ocr.FontSheet' and 'edokit.ocr.RasterOCR' were partially drafted in a previous workspace session, but they might be missing critical edge-case logic or optimization loops required to handle Alt1's standard font assets (e.g., 'pixel_8px_digits', 'aa_8px'). 
+
+Your immediate assignment is to implement or audit these two classes completely, ensuring they are production-ready, highly optimized, and contain no stubbed code.
+
+Please write the complete code matching these exact specifications:
+
+---
+
+### Specification 1: 'edokit.ocr.FontSheet' (Complete Metadata Parser)
+This class dynamically reads and holds both the visual glyph images and structural properties defined by Alt1 font schemas.
+1. Schema Properties:
+   The JSON parser (using Jackson or GSON) must handle ALL property definitions present across Alt1's font specification assets:
+   - "fontname": String identifier of the font.
+   - "basey": Base vertical offset used for character line baseline alignment.
+   - "lineheight": Step delta for multi-line block parsing.
+   - "space_width": Integer fallback value for space (' ') string separations.
+   - "glyphs": An array or object map of character bounding objects containing:
+     * "ch": The string representation of the target character.
+     * "id": Integer index assignment.
+     * "x" / "y": Origin top-left tracking positions within the source data image.
+     * "width" / "height": Strict box bounding box parameters for slicing.
+     * "advx": Horizontal advance distance (used to jump to the next letter).
+
+2. Structural Layout:
+   - Fields:
+     * 'public final EdokitImage fontImage;'
+     * 'private final Map<Character, GlyphDefinition> glyphMap;'
+     * 'public final int baseY;'
+     * 'public final int spaceWidth;'
+   - Create a nested helper 'record GlyphDefinition(int x, int y, int width, int height, int advX)'.
+   - Add a static factory constructor: 'public static FontSheet load(InputStream jsonStream, InputStream imgStream)'.
+
+---
+
+### Specification 2: 'edokit.ocr.RasterOCR' (The Scanning Engine)
+This class handles text extraction and image preparation loops directly on raw pixel arrays.
+
+1. Method: 'public String readLine(EdokitImage source, int startX, int startY, FontSheet font, int maxColorDistance)'
+   - Iterates horizontally across the source frame slice, checking for matching templates in the font's 'glyphMap'.
+   - Implement Alt1's specific 'coldif' (color difference) metrics: loop pixel-by-pixel over the candidate glyph's width and height box.
+   - For every pixel in the font template that is NOT transparent/empty alpha, compute the absolute RGB variance against the target source screen pixel:
+     int deltaR = Math.abs(fontR - srcR);
+     int deltaG = Math.abs(fontG - srcG);
+     int deltaB = Math.abs(fontB - srcB);
+   - A glyph matches if ALL non-transparent pixels fall beneath 'maxColorDistance'.
+   - Proportional Spacing: Upon a successful match, advance the cursor coordinate index horizontally by the tracked character's specific 'advX' value. If no glyph matches, advance by 1 pixel to test the next slice.
+
+2. Method: 'public void removeTextPixels(EdokitImage source, int startX, int startY, String verifiedText, FontSheet font)'
+   - This implements Alt1's mask technique. Once text (like a yellow countdown timer) is read, this method steps back through the bounding coordinates of that string.
+   - For every positive, visible pixel forming the character shapes, overwrite the matching coordinates inside the 'source' byte array to pure black (RGBA = 0, 0, 0, 0).
+   - This strips the overlay, preventing the numbers from distorting color sampling checks executed by downstream buff-detection routines.
+
+---
+
+### Performance Rules:
+- Enforce standard loop unrolling or simple flat array tracking logic using 'pixelOffset' on 'EdokitImage'.
+- Do not instantiate new object variables inside the pixel checking nested for-loops. Recycle primitives.

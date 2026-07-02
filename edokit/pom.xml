@@ -49,6 +49,17 @@
         </dependency>
 
         <!-- ================================================================
+             Gson
+             Used by edokit.ocr.FontSheet to parse Alt1 .fontmeta.json
+             glyph schema descriptors.
+        ================================================================ -->
+        <dependency>
+            <groupId>com.google.code.gson</groupId>
+            <artifactId>gson</artifactId>
+            <version>${gson.version}</version>
+        </dependency>
+
+        <!-- ================================================================
              OpenCV Java Bindings
              Used for Mat-backed native image buffers, template matching
              (matchTemplate), and future CV pipeline steps.
