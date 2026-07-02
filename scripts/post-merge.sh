@@ -1,4 +1,7 @@
 #!/bin/bash
 set -e
-pnpm install --frozen-lockfile
-pnpm --filter db push
+
+# Resolve/refresh Maven dependencies for the edokit Java project so a fresh
+# merge always has a warm local repository before the next build.
+cd "$(dirname "$0")/../edokit"
+mvn -q -DskipTests dependency:resolve

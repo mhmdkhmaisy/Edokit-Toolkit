@@ -1,0 +1,42 @@
+You are an elite Performance Engineer and Game Automation Specialist. We are entering the final architectural phase of Edokit: Phase 3, Module 5. Your task is to implement the complete tracking module 'edokit.buffs.BuffReader' based on the core programmatic logic found in Alt1's 'src/buffs/index.ts'.
+
+This class must dynamically discover the active buff grid slots on the game interface, isolate individual buff cells, parse overlay timers using our 'RasterOCR', and use color-distance pixel sampling to identify specific active buffs.
+
+Please write clean, production-ready Java code matching the following technical specifications:
+
+---
+
+### Specification 1: Structural Grid Bounds & Discovery
+1. Configuration Constants (Alt1-Exact Layout Math):
+   - 'public static final int BUFF_SIZE = 27;'  // Pixel width/height of a single buff icon
+   - 'public static final int GRID_SIZE = 30;'  // Pixel step size between horizontal slots (includes padding)
+
+2. Grid Detection Method:
+   - 'public List<Rectangle> findBuffGrid(EdokitImage screen, int anchorX, int anchorY, int maxHor, int maxVer)'
+   - This method acts as the double-pass structural analyzer. Starting from an anchor coordinate (provided by our SubImageMatcher), loop horizontally and vertically across the interface using 'GRID_SIZE' increments.
+   - It must evaluate pixel rows to detect the specific 2-pixel bounding box frames container pattern. It checks for a sequence of dark/near-black bounding pixels and the distinctive inner blue-grey border gradient.
+   - Return a compiled List of 'java.awt.Rectangle' objects bounding every actively discovered buff grid square slot coordinate space.
+
+---
+
+### Specification 2: State Tracking & The Target Matching Loop
+1. Data Model Structure:
+   - Create a nested helper 'record BuffDefinition(String name, int[] sampleOffsetsX, int[] sampleOffsetsY, int[] expectedRGBs)'
+   - This database holds unique pixel color signatures for buffs we care about (e.g., Overloads, Weapon Poison). Each definition tracks 3 to 5 highly specific local coordinate offsets inside the 27x27 square and their exact target colors.
+
+2. Core Reader Processing Method:
+   - 'public List<TrackedBuff> readBuffBar(EdokitImage screenFrame, List<Rectangle> activeSlots, FontSheet timerFont, List<BuffDefinition> database, int colorTolerance)'
+   - Loop through each 'Rectangle' slot discovered in the grid.
+   - Step A (OCR Extraction): Before evaluating the buff texture, call 'RasterOCR.readLine()' targeting the bottom half of the current slot rectangle to extract active countdown numbers.
+   - Step B (OCR Masking): Immediately execute 'RasterOCR.removeTextPixels()' to zero out the text-positive pixels inside the frame buffer, restoring the raw texture space underneath.
+   - Step C (Color Fingerprint Sampling): Implement Alt1's 'countMatch' algorithm:
+     * For each 'BuffDefinition' in your database, loop through its tracking offsets.
+     * Extract the raw color from 'screenFrame' at 'slot.x + offsetx' and 'slot.y + offsety'.
+     * Compute the absolute color delta for Red, Green, and Blue. If all offsets match within 'colorTolerance', register that buff as active in this slot.
+   - Return a List of 'TrackedBuff' objects containing the slot index, identified buff name, and remaining timer string.
+
+---
+
+### Performance Rules:
+- Execute all color calculation checks using optimized bitwise bit-shifting primitives on the 'EdokitImage.data' array.
+- Do not instantiate new object pointers inside the hot nested loop iterations. Recycle internal primitive variables to maintain zero GC overhead.
