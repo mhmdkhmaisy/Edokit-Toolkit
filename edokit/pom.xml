@@ -90,11 +90,6 @@
                     <target>${java.version}</target>
                     <release>${java.version}</release>
                     <encoding>${project.build.sourceEncoding}</encoding>
-                    <!--
-                        Enable all lint warnings during compilation so that
-                        performance-sensitive code (unchecked casts, raw types,
-                        deprecations) surfaces early.
-                    -->
                     <compilerArgs>
                         <arg>-Xlint:all</arg>
                         <arg>-Xlint:-processing</arg>
@@ -103,9 +98,33 @@
             </plugin>
 
             <!-- ============================================================
+                 Maven Dependency Plugin
+                 Copies external dependencies (Gson, JNA, OpenCV) into the 
+                 target/lib folder so the thin JAR can find them at runtime.
+            ============================================================ -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <version>3.7.0</version>
+                <executions>
+                    <execution>
+                        <id>copy-dependencies</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>copy-dependencies</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.directory}/lib</outputDirectory>
+                            <includeScope>runtime</includeScope>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- ============================================================
                  Maven Jar Plugin
-                 Produces a thin jar; fat-jar / shading is intentionally
-                 deferred until a launcher module is added.
+                 Produces a thin jar; configured to read dependencies from 
+                 the local lib/ directory via the Class-Path manifest header.
             ============================================================ -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -116,6 +135,10 @@
                         <manifest>
                             <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
                             <addDefaultSpecificationEntries>true</addDefaultSpecificationEntries>
+                            <addClasspath>true</addClasspath>
+                            <!-- Tells the JAR to look for dependencies inside the 'lib/' directory -->
+                            <classpathPrefix>lib/</classpathPrefix>
+                            <mainClass>edokit.engine.EdokitEngineRunner</mainClass>
                         </manifest>
                     </archive>
                 </configuration>
