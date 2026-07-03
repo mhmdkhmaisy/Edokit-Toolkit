@@ -30,15 +30,24 @@ import java.util.Map;
  * {@code FontSheet} parses both and exposes them in a form that
  * {@link RasterOCR} can scan efficiently with zero per-frame allocation.
  *
- * <h2>Supported JSON schemas</h2>
- * The parser handles <em>both</em> glyph-list layouts used across Alt1's font
- * assets:
+ * <h2>Alt1 font JSON schema</h2>
+ * Alt1 {@code .fontmeta.json} files store only global metadata at the root level.
+ * Per-character bounding boxes are <em>not</em> present in the JSON — they are
+ * derived at load time by scanning the accompanying sprite sheet for contiguous
+ * non-empty pixel column runs:
  * <pre>
- *   Array form   — "glyphs": [ {"ch":"0","x":0,"y":0,"width":8,"height":8,"advx":9}, … ]
- *   Object form  — "glyphs": { "0": {"x":0,"y":0,"width":8,"height":8,"advx":9}, … }
+ *   {
+ *     "basey":      7,                  // baseline y offset inside the sprite sheet
+ *     "spacewidth": 3,                  // advance width for the space character
+ *     "chars":      "0123456789m()hr",  // characters in left-to-right sprite order
+ *     "treshold":   0.9,               // (unused by Edokit — Alt1 internal)
+ *     "color":      [255, 255, 255],   // (unused by Edokit — Alt1 internal)
+ *     "shadow":     true               // (unused by Edokit — Alt1 internal)
+ *   }
  * </pre>
- * All top-level schema fields are optional with documented defaults so that
- * partial or minimal font definitions load without errors.
+ * {@code FontSheet.load()} reads {@code "chars"} to know which character occupies
+ * each glyph run, then scans the PNG column-by-column to locate each run's
+ * {@code x}, {@code width}, and advance width automatically.
  *
  * <h2>Memory layout</h2>
  * The full font sprite sheet is held as a single {@link EdokitImage} whose
@@ -154,64 +163,51 @@ public final class FontSheet {
             root = JsonParser.parseReader(reader).getAsJsonObject();
         }
 
-        final String fontName   = getStringOrDefault(root, "fontname",     "unknown");
-        final int    baseY      = getIntOrDefault(root,    "basey",         0);
-        final int    lineHeight = getIntOrDefault(root,    "lineheight",    0);
-        final int    spaceWidth = getIntOrDefault(root,    "space_width",   4);
+        // "fontname" is an optional label; absent from all shipped Alt1 assets.
+        final String fontName   = getStringOrDefault(root, "fontname",   "Alt1 Font");
+        // "basey" — vertical baseline offset inside the sprite sheet (pixels from top).
+        final int    baseY      = getIntOrDefault(root,    "basey",       0);
+        // "lineheight" — multi-line step; absent from most Alt1 assets, default 0.
+        final int    lineHeight = getIntOrDefault(root,    "lineheight",  0);
+        // Alt1 uses "spacewidth" (no underscore) for the space-character advance.
+        final int    spaceWidth = getIntOrDefault(root,    "spacewidth",  4);
 
-        // ── Parse glyph definitions ───────────────────────────────────────────
-        // LinkedHashMap preserves JSON declaration order for stable readLine iteration.
-        final Map<Character, GlyphDefinition> glyphMap = new LinkedHashMap<>();
-
-        final JsonElement glyphsEl = root.get("glyphs");
-        if (glyphsEl == null || glyphsEl.isJsonNull()) {
+        // ── Read the "chars" character-order string ───────────────────────────
+        // Alt1 font JSONs carry NO per-character x/y/width/height data.
+        // "chars" is the sole source of character identity: chars.charAt(i) names
+        // the i-th glyph run in the sprite sheet (left-to-right order).
+        final JsonElement charsEl = root.get("chars");
+        if (charsEl == null || charsEl.isJsonNull()) {
             throw new IllegalArgumentException(
-                    "Font JSON for \"" + fontName + "\" contains no \"glyphs\" field.");
+                    "Font JSON for \"" + fontName + "\" is missing the required "
+                    + "\"chars\" field.  This field must list every character rendered "
+                    + "in the accompanying sprite sheet, in left-to-right order.");
         }
-
-        if (glyphsEl.isJsonArray()) {
-            /*
-             * Array form:
-             *   "glyphs": [ {"ch":"A","x":0,"y":0,"width":7,"height":9,"advx":8}, … ]
-             *
-             * The "ch" field carries the character.  "id" is parsed but not stored;
-             * it is an Alt1 internal index not needed for pixel-level matching.
-             */
-            for (JsonElement el : glyphsEl.getAsJsonArray()) {
-                if (!el.isJsonObject()) continue;
-                parseGlyphObject(el.getAsJsonObject(), null, glyphMap, fontName);
-            }
-
-        } else if (glyphsEl.isJsonObject()) {
-            /*
-             * Object / map form:
-             *   "glyphs": { "A": {"x":0,"y":0,"width":7,"height":9,"advx":8}, … }
-             *
-             * The map key is the character string; "ch" inside the object is
-             * optional and, if present, takes precedence over the key.
-             */
-            for (Map.Entry<String, JsonElement> entry : glyphsEl.getAsJsonObject().entrySet()) {
-                if (!entry.getValue().isJsonObject()) continue;
-                parseGlyphObject(entry.getValue().getAsJsonObject(),
-                                 entry.getKey(), glyphMap, fontName);
-            }
-
-        } else {
+        final String charsStr = charsEl.getAsString();
+        if (charsStr.isEmpty()) {
             throw new IllegalArgumentException(
-                    "\"glyphs\" in font \"" + fontName
-                    + "\" must be a JSON array or object, got: "
-                    + glyphsEl.getClass().getSimpleName());
-        }
-
-        if (glyphMap.isEmpty()) {
-            throw new IllegalArgumentException(
-                    "Font \"" + fontName + "\" parsed 0 valid glyph entries.");
+                    "Font JSON for \"" + fontName + "\" has an empty \"chars\" string — "
+                    + "at least one character must be listed.");
         }
 
         // ── Load sprite sheet ─────────────────────────────────────────────────
         // EdokitImageLoader strips ICC/gamma profiles so pixel values are the
         // raw, uncorrected digital colour values used by the Alt1 schema.
         final EdokitImage fontImage = EdokitImageLoader.load(imgStream);
+
+        // ── Derive per-glyph bounds by scanning the sprite sheet ──────────────
+        // Glyphs are packed into a single horizontal strip with no embedded
+        // coordinate data.  scanGlyphs() locates each glyph by finding
+        // contiguous non-empty pixel column runs and assigns them to characters
+        // in "chars" declaration order.
+        final Map<Character, GlyphDefinition> glyphMap = new LinkedHashMap<>();
+        scanGlyphs(fontImage, charsStr, glyphMap, fontName, spaceWidth);
+
+        if (glyphMap.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Font \"" + fontName + "\" yielded 0 glyph entries after sprite "
+                    + "sheet scan.  Verify that the PNG contains visible glyph pixels.");
+        }
 
         return new FontSheet(fontImage,
                 Collections.unmodifiableMap(glyphMap),
@@ -262,53 +258,140 @@ public final class FontSheet {
     // =========================================================================
 
     /**
-     * Parses one glyph JSON object and inserts it into {@code target}.
+     * Scans {@code img} left-to-right for contiguous non-empty pixel column runs
+     * and maps each discovered run to the corresponding character in {@code chars}.
      *
-     * <p>Character resolution priority:
-     * <ol>
-     *   <li>{@code "ch"} field inside the object (supports multi-byte chars in
-     *       fonts that encode them as strings).</li>
-     *   <li>{@code mapKey} — the outer object key when using map-form JSON.</li>
-     * </ol>
-     * Entries with no resolvable character, or with zero width/height, are
-     * silently skipped (they represent internal placeholder slots).
+     * <h3>Empty-column strategy</h3>
+     * <ul>
+     *   <li><b>Alpha-channel fonts</b> — if any pixel in the entire sprite sheet
+     *       has {@code A == 0}, the sheet uses a transparent background.  A column
+     *       is then empty when every pixel in it has {@code A == 0}.</li>
+     *   <li><b>Opaque-background fonts</b> — all pixels have {@code A == 0xFF}
+     *       (e.g. sheets decoded from 3-channel PNGs).  A column is empty when
+     *       every pixel reads solid black ({@code R == G == B == 0}).</li>
+     * </ul>
      *
-     * @param obj     the glyph JSON object
-     * @param mapKey  outer key if this came from an object-form glyphs field,
-     *                {@code null} for array-form
-     * @param target  destination map
-     * @param fontName font name for diagnostics only
+     * <h3>Advance width</h3>
+     * The Alt1 JSON carries no per-character advance width.  Each glyph's
+     * {@code advX} is computed as {@code pixelWidth + 1}, matching the one-pixel
+     * inter-character gap Alt1's renderer inserts between consecutive glyphs.
+     *
+     * @param img        the font sprite sheet in raw RGBA format
+     * @param chars      ordered character string from the {@code "chars"} JSON field
+     * @param target     destination map (insertion order preserved via LinkedHashMap)
+     * @param fontName   font identifier used in diagnostic log messages only
+     * @param spaceWidth space-character advance width from the JSON descriptor
      */
-    private static void parseGlyphObject(JsonObject obj,
-                                         String mapKey,
-                                         Map<Character, GlyphDefinition> target,
-                                         String fontName) {
-        // Resolve character: prefer "ch" inside the object, fall back to mapKey.
-        final String chStr;
-        if (obj.has("ch") && !obj.get("ch").isJsonNull()) {
-            chStr = obj.get("ch").getAsString();
-        } else if (mapKey != null && !mapKey.isEmpty()) {
-            chStr = mapKey;
-        } else {
-            return; // No character identity — skip
+    private static void scanGlyphs(EdokitImage img,
+                                    String chars,
+                                    Map<Character, GlyphDefinition> target,
+                                    String fontName,
+                                    int spaceWidth) {
+        final int    imgWidth  = img.width;
+        final int    imgHeight = img.height;
+        final byte[] data      = img.data;
+
+        // Choose empty-column strategy once, based on whether any transparent
+        // pixel exists anywhere in the sprite sheet.
+        final boolean useAlpha = hasAnyTransparentPixel(data);
+
+        int charIndex = 0;
+        int x         = 0;
+
+        while (x < imgWidth && charIndex < chars.length()) {
+
+            // ── Skip inter-glyph gap (empty columns) ──────────────────────────
+            while (x < imgWidth && isColumnEmpty(data, x, imgWidth, imgHeight, useAlpha)) {
+                x++;
+            }
+            if (x >= imgWidth) break;
+
+            // ── Accumulate glyph body (consecutive non-empty columns) ──────────
+            final int glyphStartX = x;
+            while (x < imgWidth && !isColumnEmpty(data, x, imgWidth, imgHeight, useAlpha)) {
+                x++;
+            }
+            final int glyphWidth = x - glyphStartX;
+            if (glyphWidth <= 0) continue;
+
+            // ── Commit GlyphDefinition ─────────────────────────────────────────
+            // y = 0: all glyphs sit at the top of the single-row sprite strip.
+            // advX = pixelWidth + 1 mirrors Alt1's one-pixel inter-glyph cursor advance.
+            // Fallback: if width is somehow 0 (degenerate), use spaceWidth as advX.
+            final int advX = (glyphWidth > 0) ? (glyphWidth + 1) : (spaceWidth + 1);
+            final char ch  = chars.charAt(charIndex);
+            target.put(ch, new GlyphDefinition(glyphStartX, 0, glyphWidth, imgHeight, advX));
+            charIndex++;
         }
 
-        if (chStr.isEmpty()) return;
-        final char ch = chStr.charAt(0);
+        if (charIndex < chars.length()) {
+            System.err.printf(
+                    "[FontSheet] Warning: \"%s\" — sprite sheet yielded %d glyph(s) "
+                    + "but \"chars\" declares %d.  The PNG may be clipped or "
+                    + "contain fewer glyph runs than expected.%n",
+                    fontName, charIndex, chars.length());
+        }
+    }
 
-        final int x      = getIntOrDefault(obj, "x",      0);
-        final int y      = getIntOrDefault(obj, "y",      0);
-        final int width  = getIntOrDefault(obj, "width",  0);
-        final int height = getIntOrDefault(obj, "height", 0);
+    /**
+     * Returns {@code true} if any pixel in the flat RGBA byte array has an alpha
+     * value of {@code 0} (fully transparent).
+     *
+     * <p>Used once per {@link #load} call to select the background-detection
+     * strategy for {@link #isColumnEmpty}: transparent-background sheet if any
+     * transparent pixel is found; opaque-black-background sheet otherwise.
+     *
+     * @param data flat RGBA byte array from an {@link EdokitImage}
+     * @return {@code true} if at least one pixel has {@code A == 0}
+     */
+    private static boolean hasAnyTransparentPixel(byte[] data) {
+        // Alpha is at index 3 of every 4-byte pixel (RGBA layout).
+        for (int i = 3; i < data.length; i += 4) {
+            if ((data[i] & 0xFF) == 0) return true;
+        }
+        return false;
+    }
 
-        // Skip degenerate entries (width=0 or height=0 means no renderable pixels).
-        if (width <= 0 || height <= 0) return;
-
-        // "advx" is the horizontal cursor advance after this character is drawn.
-        // If absent, default to the glyph's own pixel width (monospaced fallback).
-        final int advX = getIntOrDefault(obj, "advx", width);
-
-        target.put(ch, new GlyphDefinition(x, y, width, height, advX));
+    /**
+     * Returns {@code true} if every pixel in column {@code col} of the sprite
+     * sheet is considered empty (not part of any rendered glyph).
+     *
+     * <p>The emptiness criterion depends on the background strategy:
+     * <ul>
+     *   <li>{@code useAlpha = true}: pixel is empty when {@code A == 0}.</li>
+     *   <li>{@code useAlpha = false}: pixel is empty when
+     *       {@code R == 0 && G == 0 && B == 0} (solid black background).</li>
+     * </ul>
+     *
+     * <p>No objects are allocated here — every access is a direct index into
+     * the backing {@code byte[]} with a branch-free unsigned comparison.
+     *
+     * @param data      flat RGBA byte array from an {@link EdokitImage}
+     * @param col       x-coordinate of the column to test (0-based)
+     * @param imgWidth  sprite sheet width in pixels (used as row stride)
+     * @param imgHeight sprite sheet height in pixels (number of rows to check)
+     * @param useAlpha  {@code true} to test the alpha channel;
+     *                  {@code false} to test RGB channels against black
+     * @return {@code true} if the entire column contains no glyph pixels
+     */
+    private static boolean isColumnEmpty(byte[] data,
+                                         int col,
+                                         int imgWidth,
+                                         int imgHeight,
+                                         boolean useAlpha) {
+        for (int row = 0; row < imgHeight; row++) {
+            final int off = (col + imgWidth * row) * 4;
+            if (useAlpha) {
+                // Transparent-background: any non-zero alpha = glyph pixel present.
+                if ((data[off + 3] & 0xFF) != 0) return false;
+            } else {
+                // Opaque-background: any non-zero RGB channel = glyph pixel present.
+                if ((data[off]     & 0xFF) != 0) return false;
+                if ((data[off + 1] & 0xFF) != 0) return false;
+                if ((data[off + 2] & 0xFF) != 0) return false;
+            }
+        }
+        return true;
     }
 
     // ── Null-safe JSON primitive accessors ────────────────────────────────────

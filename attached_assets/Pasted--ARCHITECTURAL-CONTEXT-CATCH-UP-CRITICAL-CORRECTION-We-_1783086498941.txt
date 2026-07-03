@@ -1,0 +1,29 @@
+### ARCHITECTURAL CONTEXT CATCH-UP & CRITICAL CORRECTION
+We are correcting a JSON mapping bug in our "Edokit" Java tracking engine. The application currently fails on startup with a parsing exception inside 'FontSheet.java' because it looks for a non-existent root-level "glyphs" field. 
+
+Alt1's genuine '.fontmeta.json' files place glyph data definitions right at the root level alongside global metadata properties. Characters (like "0", "a", ":") are themselves the top-level keys of the JSON object.
+
+### CURRENT DIRECTIVE: SCAN LOCAL METADATA & REFACTOR 'edokit.ocr.FontSheet.java'
+Before writing any code, look directly inside the project's 'src/main/resources/fonts/' folder, open the '.fontmeta.json' files being used, and inspect their actual structure to verify the exact key-value layouts.
+
+Please rewrite the 'FontSheet.load(InputStream jsonStream, InputStream imgStream)' factory method to correctly interpret this root-level font schema:
+
+1. Implement Dynamic Root-Field Inspection:
+   - Use Jackson ObjectMapper or GSON to parse the JSON input into a generic JsonNode or Map structure representing the root element.
+   - Extract global configurations safely by trying to read these exact keys:
+     * "fontname" (String, default to "Alt1 Font" if null)
+     * "basey" (int, default to 0 if missing)
+     * "lineheight" (int, default to 12 if missing)
+     * "space_width" (int, default to 4 if missing)
+
+2. Map Character Fields Automatically:
+   - Iterate over ALL keys at the root level of the JSON document using a dynamic loop (like fields() or entrySet()).
+   - Explicitly skip the known global tracking keys ("fontname", "basey", "lineheight", "space_width").
+   - For every other key, treat the key string as the character glyph itself (e.g., if the key string is "5", the character is '5'). Handle special edge cases if a key uses words like "colon" to map it to ':'.
+   - For each character node, extract its tracking metrics: 'x', 'y', 'width', 'height', and 'advx'. Ensure you map 'advx' precisely to our internal record field.
+   - Instantiate our nested 'GlyphDefinition' record and cache it inside our 'glyphMap' using the Character object as the lookup key.
+
+3. Graceful Fallbacks:
+   - Ensure that if an individual character node is missing an 'advx' field, it fallbacks cleanly to using the bounding 'width + 1' layout as the horizontal tracking step increment.
+
+Ensure the final code is production-ready, free of empty code stubs, and restores complete compatibility with our 'EdokitEngineRunner' main method loop.
