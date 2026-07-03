@@ -2,36 +2,43 @@ package edokit.ocr;
 
 import edokit.base.models.EdokitImage;
 
-import java.util.Map;
-
 /**
- * RasterOCR — Pixel-exact raster text scanner for RuneScape's UI fonts.
+ * RasterOCR — Alt1-faithful raster text scanner for RuneScape's UI fonts.
  *
- * <h2>What this is</h2>
- * A pure-Java, no-external-engine OCR implementation tuned for RuneScape's
- * interface fonts.  These fonts use hard-edged, shadow-composited glyphs on
- * a predictable coloured background — a property that makes pixel-exact colour
- * distance matching far more reliable and faster than probabilistic OCR.
+ * <h2>Scoring model</h2>
+ * This engine mirrors Alt1's {@code readChar} / {@code canblend} pipeline from
+ * {@code src/ocr/index.ts} exactly.  Rather than comparing template pixel colours
+ * to screen colours directly, it asks a more robust question:
  *
- * <p>The engine mirrors Alt1's {@code ocr} module: it walks a horizontal scan
- * line, tries every known glyph at each position, and advances the cursor
- * by the glyph's tracked advance width on a successful match.
+ * <blockquote><i>"Could this screen pixel be the result of blending the font
+ * colour with <em>some</em> plausible background colour?"</i></blockquote>
  *
- * <h2>Performance contract</h2>
+ * The answer is computed by {@link #canblend}: extrapolate from the screen pixel
+ * away from the font colour by the leverage factor implied by the template pixel's
+ * match strength.  If the extrapolated background lands inside {@code [0,255]³}
+ * the penalty is 0; otherwise the penalty equals how far outside it lands.
+ *
+ * <h2>Per-glyph scoring</h2>
+ * For each candidate glyph:
  * <ul>
- *   <li>No objects are allocated inside the hot pixel-checking loops.
- *       All intermediate values are stack-local {@code int} primitives.</li>
- *   <li>Pixel addressing uses {@link EdokitImage#pixelOffset} (a final method
- *       the JIT inlines to a bare multiply-add).</li>
- *   <li>The early-exit {@code coldif} check short-circuits the inner loops the
- *       moment any pixel exceeds the colour distance — no wasted comparisons.</li>
+ *   <li>{@code score} — raw penalty sum; short-circuits at 400.</li>
+ *   <li>{@code sizeScore = -bonus + Σ(penalty − bonusPerPixel)} — biased so larger
+ *       glyphs with more pixels and lower per-pixel error win over smaller,
+ *       ambiguous ones.  The winner is the glyph with the lowest sizeScore.</li>
  * </ul>
+ * A glyph is rejected if fewer than 60 % of its template pixels were in-bounds
+ * and checked (or all pixels for very small glyphs with ≤ 6 template points).
+ *
+ * <h2>Secondary characters</h2>
+ * Glyphs marked {@link FontSheet.GlyphDef#secondary()} (from the JSON
+ * {@code "seconds"} field) are tried alongside primary glyphs in
+ * {@link #readLine}.  They participate in the scoring competition on equal terms
+ * — but because they typically have fewer template pixels their natural bonus is
+ * smaller, so they only win when nothing else fits.
  *
  * <h2>Thread safety</h2>
- * {@code RasterOCR} is stateless — all state lives in the caller-supplied
- * {@link EdokitImage} and {@link FontSheet} arguments.  Multiple threads may
- * call {@link #readLine} concurrently on different source images without
- * synchronisation.
+ * {@code RasterOCR} is stateless.  Multiple threads may call {@link #readLine}
+ * and {@link #removeTextPixels} concurrently without synchronisation.
  */
 public final class RasterOCR {
 
@@ -41,125 +48,80 @@ public final class RasterOCR {
 
     /**
      * Reads a single horizontal text line from {@code source} starting at
-     * {@code (startX, startY)}, using the glyph templates in {@code font}.
+     * {@code (startX, startY)}, using the processed glyph data in {@code font}.
      *
      * <h3>Algorithm</h3>
      * <pre>
      *   cursorX ← startX
      *   while cursorX &lt; source.width:
-     *     for each glyph G in font.glyphMap (declaration order):
-     *       if matchesGlyph(source, cursorX, startY, G, maxColorDistance):
-     *         if gap since last match ≥ font.spaceWidth → append ' '
-     *         append G.character
-     *         cursorX += G.advX
-     *         gapPixels ← 0
-     *         break
-     *     else (no glyph matched):
-     *       cursorX += 1
-     *       gapPixels += 1
-     *       if gapPixels &gt; END_OF_LINE_THRESHOLD → stop (end of text)
+     *     match ← readChar(source, font, cursorX, startY, allowSecondary=true)
+     *     if match ≠ null:
+     *       if gap ≥ font.spaceWidth → append ' '
+     *       append match.chr
+     *       cursorX += match.width
+     *       gapPixels ← 0
+     *     else:
+     *       cursorX += 1; gapPixels += 1
+     *       if gapPixels ≥ stopAfter → stop
      * </pre>
-     *
-     * <h3>Colour distance ({@code coldif})</h3>
-     * For each non-transparent pixel in the font glyph template, the
-     * per-channel absolute difference against the corresponding source pixel
-     * is computed:
-     * <pre>
-     *   deltaR = |fontR − srcR|
-     *   deltaG = |fontG − srcG|
-     *   deltaB = |fontB − srcB|
-     * </pre>
-     * A glyph matches only if <em>all</em> visible pixels satisfy
-     * {@code deltaR ≤ maxColorDistance ∧ deltaG ≤ maxColorDistance ∧ deltaB ≤ maxColorDistance}.
-     * The check short-circuits on the first failing pixel.
      *
      * <h3>Space detection</h3>
-     * When the horizontal gap between two consecutive matched glyphs reaches or
-     * exceeds {@link FontSheet#spaceWidth} pixels, a single {@code ' '} is
-     * inserted before the next character.  Trailing gaps (after the last glyph)
-     * do not produce trailing spaces.
+     * When {@code gapPixels} reaches {@link FontSheet.FontDef#spaceWidth()} between
+     * two matched glyphs a single {@code ' '} is inserted.  Trailing gaps do not
+     * produce trailing spaces.
      *
      * <h3>Termination</h3>
-     * Scanning stops when the cursor reaches {@code source.width} or when
-     * {@code NO_MATCH_STOP_PIXELS} consecutive non-matching pixels have been
-     * seen — the latter heuristic prevents scanning through large empty regions
-     * of the frame after the text ends.
+     * Scanning stops when the cursor reaches {@code source.width} or after
+     * {@code max(spaceWidth × 3, 16)} consecutive unmatched pixels.
      *
-     * @param source           the live frame to read from
-     * @param startX           left edge of the scan region (inclusive, 0-based)
-     * @param startY           top edge of the scan region (inclusive, 0-based);
-     *                         caller should account for {@link FontSheet#baseY}
-     *                         when positioning this relative to a UI element
-     * @param font             the font schema and sprite sheet to match against
-     * @param maxColorDistance maximum per-channel RGB delta for a pixel to be
-     *                         considered "matching" (typically 30–80; lower =
-     *                         stricter)
-     * @return the recognised text string; empty if no glyphs were found
+     * @param source  the live frame to read from
+     * @param startX  left edge of the scan region (inclusive)
+     * @param startY  top of the glyph content rows in the source image.
+     *                This is the top-of-content coordinate, <em>not</em> the
+     *                baseline — i.e. the same Y the caller has been using to
+     *                position the text region within the frame.
+     * @param font    the loaded {@link FontSheet}
+     * @return the recognised text; empty string if no glyphs matched
      */
     public String readLine(EdokitImage source,
                            int startX,
                            int startY,
-                           FontSheet font,
-                           int maxColorDistance) {
+                           FontSheet font) {
 
-        // ── Guard: scan region must have at least 1 valid pixel row ───────────
-        if (startX >= source.width || startY >= source.height || startX < 0 || startY < 0) {
+        if (startX < 0 || startY < 0
+                || startX >= source.width || startY >= source.height) {
             return "";
         }
 
-        final StringBuilder result   = new StringBuilder(32);
-        final byte[]        srcData  = source.data;
-        final int           srcWidth = source.width;
-
-        // Snapshot of the glyph map entry set — stable iteration, no allocation.
-        final Map<Character, FontSheet.GlyphDefinition> glyphs = font.glyphMap();
+        final FontSheet.FontDef fd        = font.fontDef();
+        final StringBuilder     result    = new StringBuilder(32);
+        final byte[]            srcData   = source.data;
+        final int               srcWidth  = source.width;
+        final int               srcHeight = source.height;
 
         int cursorX   = startX;
-        int gapPixels = 0;       // pixels advanced since last confirmed glyph match
+        int gapPixels = 0;
+        // Stop once this many consecutive pixels fail to match any glyph.
+        final int stopAfter = Math.max(fd.spaceWidth() * 3, 16);
 
-        // How many consecutive non-matching pixels before we declare end-of-line.
-        // Set to a generous value (3× the largest typical advance width) so that
-        // proportional fonts with wide inter-character gaps are handled correctly.
-        final int stopAfter = Math.max(font.spaceWidth * 4, 16);
-
-        outer:
         while (cursorX < srcWidth) {
 
-            // ── Try every glyph at the current cursor position ─────────────────
-            for (Map.Entry<Character, FontSheet.GlyphDefinition> entry : glyphs.entrySet()) {
-                final char                     ch    = entry.getKey();
-                final FontSheet.GlyphDefinition glyph = entry.getValue();
+            final CharMatch match =
+                    readChar(srcData, srcWidth, srcHeight, fd, cursorX, startY, true);
 
-                // Bounds guard: skip if glyph would extend beyond source edges.
-                if (cursorX + glyph.width()  > srcWidth
-                 || startY  + glyph.height() > source.height) {
-                    continue;
+            if (match != null) {
+                // Insert a space when a gap at least spaceWidth wide preceded this glyph.
+                if (!result.isEmpty() && gapPixels >= fd.spaceWidth()) {
+                    result.append(' ');
                 }
-
-                if (glyphMatchesColdif(srcData, source.width,
-                                       cursorX, startY,
-                                       font.fontImage.data, font.fontImage.width,
-                                       glyph, maxColorDistance)) {
-
-                    // ── Successful match ───────────────────────────────────────
-                    // Insert a space if a large enough gap preceded this glyph.
-                    if (!result.isEmpty() && gapPixels >= font.spaceWidth) {
-                        result.append(' ');
-                    }
-
-                    result.append(ch);
-                    cursorX   += glyph.advX();
-                    gapPixels  = 0;
-                    continue outer; // restart outer loop at updated cursor
-                }
+                result.append(match.glyph().chr());
+                cursorX  += match.glyph().width();
+                gapPixels = 0;
+            } else {
+                cursorX++;
+                gapPixels++;
+                if (gapPixels >= stopAfter) break;
             }
-
-            // ── No glyph matched at this position ──────────────────────────────
-            cursorX++;
-            gapPixels++;
-
-            // End-of-line heuristic: stop scanning after a long unmatched run.
-            if (gapPixels >= stopAfter) break;
         }
 
         return result.toString();
@@ -170,37 +132,22 @@ public final class RasterOCR {
     // =========================================================================
 
     /**
-     * Zeroes out the source pixels that form {@code verifiedText} starting at
-     * {@code (startX, startY)}, using the same cursor-advance logic as
-     * {@link #readLine}.
+     * Zeroes out every template pixel from {@code verifiedText} in the source
+     * image, using the same cursor-advance logic as {@link #readLine}.
      *
-     * <h3>Purpose</h3>
-     * After reading an overlay label (e.g. a yellow countdown timer on a buff
-     * icon), the digit pixels must be erased from the source buffer before
-     * downstream colour-sampling routines inspect the same region.  This
-     * prevents the text pixels from biasing colour-distance checks performed by
-     * the buff-detection pipeline.
+     * <p>Only pixels listed in {@link FontSheet.GlyphDef#pixels()} (i.e. those
+     * whose match strength exceeded the load-time threshold) are cleared.  Each
+     * cleared pixel is set to fully-transparent black {@code [0, 0, 0, 0]}.
      *
-     * <h3>What "zero out" means</h3>
-     * Only pixels where the corresponding font template pixel has
-     * {@code alpha > 0} are cleared.  Each such pixel in {@code source.data}
-     * is set to {@code [R=0, G=0, B=0, A=0]} — fully transparent black.  This
-     * matches Alt1's {@code removeTextPixels} masking technique.
+     * <p>This matches Alt1's {@code removeTextPixels} masking technique: after
+     * reading a countdown timer, erase its digit pixels so the underlying icon
+     * colour is available for buff-fingerprint matching.
      *
-     * <h3>Cursor advance</h3>
-     * The cursor advances by {@link FontSheet.GlyphDefinition#advX()} for each
-     * matched character, mirroring the exact advance used during {@link #readLine}.
-     * Space characters ({@code ' '}) advance by {@link FontSheet#spaceWidth}.
-     * Unknown characters (not in the glyph map) advance by 1 pixel.
-     *
-     * @param source        the live frame to modify in-place
-     * @param startX        left edge of the text region (same value used in
-     *                      the corresponding {@link #readLine} call)
-     * @param startY        top edge of the text region
-     * @param verifiedText  the string previously returned by {@link #readLine};
-     *                      must be the exact sequence of characters to erase
-     * @param font          the font schema whose glyph bounding boxes define
-     *                      which pixels to zero out
+     * @param source        the live frame to mutate in-place
+     * @param startX        left edge of the text region (same as the {@link #readLine} call)
+     * @param startY        top of the glyph content rows (same as the {@link #readLine} call)
+     * @param verifiedText  the string returned by the preceding {@link #readLine} call
+     * @param font          the loaded {@link FontSheet}
      */
     public void removeTextPixels(EdokitImage source,
                                  int startX,
@@ -210,161 +157,221 @@ public final class RasterOCR {
 
         if (verifiedText == null || verifiedText.isEmpty()) return;
         if (startX < 0 || startY < 0
-         || startX >= source.width || startY >= source.height) return;
+                || startX >= source.width || startY >= source.height) return;
 
-        final byte[] srcData     = source.data;
-        final byte[] fontData    = font.fontImage.data;
-        final int    srcWidth    = source.width;
-        final int    fontImgWidth = font.fontImage.width;
+        final FontSheet.FontDef fd        = font.fontDef();
+        final byte[]            srcData   = source.data;
+        final int               srcWidth  = source.width;
+        final int               srcHeight = source.height;
+        final int               stride    = fd.shadow() ? 4 : 3;
 
         int cursorX = startX;
 
         for (int ci = 0; ci < verifiedText.length(); ci++) {
             final char ch = verifiedText.charAt(ci);
 
-            // ── Space character: advance without zeroing ───────────────────────
             if (ch == ' ') {
-                cursorX += font.spaceWidth;
+                cursorX += fd.spaceWidth();
                 continue;
             }
 
-            final FontSheet.GlyphDefinition glyph = font.getGlyph(ch);
-
-            // ── Unknown character: advance 1 pixel and skip ────────────────────
+            final FontSheet.GlyphDef glyph = fd.findGlyph(ch);
             if (glyph == null) {
                 cursorX++;
                 continue;
             }
 
-            final int gw = glyph.width();
-            final int gh = glyph.height();
-            final int gx = glyph.x();
-            final int gy = glyph.y();
+            final int[] pixels = glyph.pixels();
 
-            // ── Zero out every visible (alpha > 0) font pixel in source ────────
-            // All index arithmetic reuses primitive locals — zero heap allocation.
-            for (int dy = 0; dy < gh; dy++) {
-                // Pre-compute row start offsets once per row.
-                final int fontRowStart = (4 * gx) + (4 * fontImgWidth * (gy + dy));
-                final int srcY         = startY + dy;
+            for (int a = 0; a < pixels.length; a += stride) {
+                final int srcX = cursorX + pixels[a];
+                final int srcY = startY  + pixels[a + 1];
 
-                // Bounds: skip rows that fall outside the source image vertically.
-                if (srcY >= source.height) break;
+                if (srcX < 0 || srcX >= srcWidth || srcY < 0 || srcY >= srcHeight) continue;
 
-                final int srcRowStart = (4 * cursorX) + (4 * srcWidth * srcY);
-
-                for (int dx = 0; dx < gw; dx++) {
-                    // Bounds: skip columns outside the source image horizontally.
-                    final int srcX = cursorX + dx;
-                    if (srcX >= srcWidth) break;
-
-                    final int fontOffset = fontRowStart + (dx * 4);
-                    final int fontAlpha  = fontData[fontOffset + 3] & 0xFF;
-
-                    // Only overwrite pixels where the font template is visible.
-                    if (fontAlpha == 0) continue;
-
-                    final int srcOffset = srcRowStart + (dx * 4);
-                    srcData[srcOffset]     = 0; // R → 0
-                    srcData[srcOffset + 1] = 0; // G → 0
-                    srcData[srcOffset + 2] = 0; // B → 0
-                    srcData[srcOffset + 3] = 0; // A → 0  (fully transparent)
-                }
+                final int off = (srcX + srcWidth * srcY) * 4;
+                srcData[off]     = 0; // R → 0
+                srcData[off + 1] = 0; // G → 0
+                srcData[off + 2] = 0; // B → 0
+                srcData[off + 3] = 0; // A → 0  (fully transparent)
             }
 
-            cursorX += glyph.advX();
+            cursorX += glyph.width();
         }
     }
 
     // =========================================================================
-    // Internal: coldif pixel-level glyph match check
+    // Internal: readChar
     // =========================================================================
 
     /**
-     * Returns {@code true} if the glyph template, positioned with its top-left
-     * corner at {@code (srcX, srcY)} in the source image, matches within
-     * {@code maxColorDistance} on every non-transparent template pixel.
+     * Tries every glyph in {@code fd} at screen position {@code (x, y)} and
+     * returns the best match, or {@code null} if nothing passes scoring.
      *
-     * <h3>Why separate data/width parameters instead of EdokitImage</h3>
-     * Passing the raw {@code byte[]} arrays and stride widths directly avoids
-     * two object-field loads ({@code .data}, {@code .width}) per loop iteration.
-     * At 30 FPS with hundreds of glyph candidates per frame, this keeps the
-     * inner loop tight enough for the JIT to fully unroll short glyphs.
+     * <h3>Scoring summary</h3>
+     * <pre>
+     *   sizeScore₀ = −bonus + N × bonusPerPixel
+     *   for each template pixel p:
+     *     penalty ← canblend(screenPixel, fontColour × lum_p, strength_p)
+     *     score     += penalty
+     *     sizeScore += penalty − bonusPerPixel
+     *     if score &gt; 400 → discard this glyph
+     *   if checkedPixels &lt; N × 0.6 → discard
+     *   winner = glyph with lowest sizeScore (score ≤ 400)
+     * </pre>
      *
-     * <h3>Short-circuit guarantee</h3>
-     * The method returns {@code false} the instant any visible pixel's
-     * per-channel delta exceeds {@code maxColorDistance}.  Only fully matching
-     * glyphs traverse their entire bounding box.
+     * <p>All arithmetic uses {@code double} to match Alt1's JavaScript floats.
      *
-     * <h3>Minimum visible-pixel requirement</h3>
-     * A glyph with zero visible pixels (fully transparent sprite sheet region)
-     * always returns {@code false} — it must not match every candidate position.
-     *
-     * @param srcData          {@link EdokitImage#data} of the source frame
-     * @param srcStride        {@link EdokitImage#width} of the source frame
-     * @param srcX             left edge of the candidate match in source space
-     * @param srcY             top edge of the candidate match in source space
-     * @param fontData         {@link EdokitImage#data} of the font sprite sheet
-     * @param fontStride       {@link EdokitImage#width} of the font sprite sheet
-     * @param glyph            glyph bounding box and origin in the sprite sheet
-     * @param maxColorDistance maximum per-channel delta for a passing pixel
-     * @return {@code true} if all visible glyph pixels are within the distance
+     * @param srcData       raw RGBA bytes of the source frame
+     * @param srcWidth      stride of the source frame
+     * @param srcHeight     height of the source frame
+     * @param fd            processed font definition
+     * @param x             cursor X — left edge of the candidate glyph in source
+     * @param y             cursor Y — top of content rows in source
+     * @param allowSecondary {@code true} to include secondary-flagged glyphs
+     * @return the best-matching {@link CharMatch}, or {@code null}
      */
-    private static boolean glyphMatchesColdif(byte[] srcData,  int srcStride,
-                                              int    srcX,      int srcY,
-                                              byte[] fontData,  int fontStride,
-                                              FontSheet.GlyphDefinition glyph,
-                                              int maxColorDistance) {
-        final int gw = glyph.width();
-        final int gh = glyph.height();
-        final int gx = glyph.x();
-        final int gy = glyph.y();
+    private static CharMatch readChar(byte[] srcData, int srcWidth, int srcHeight,
+                                      FontSheet.FontDef fd,
+                                      int x, int y,
+                                      boolean allowSecondary) {
 
-        // Pre-compute row-start offsets for the first row of each operand.
-        // Inside the loop we increment by stride (4*width bytes) each row.
-        int fontRowBase = (4 * gx) + (4 * fontStride * gy);
-        int srcRowBase  = (4 * srcX) + (4 * srcStride * srcY);
+        final double MAX_SCORE    = 400.0;
+        final int    stride       = fd.shadow() ? 4 : 3;
+        final int    bpp          = fd.bonusPerPixel();
+        final double fontR        = fd.fontR();
+        final double fontG        = fd.fontG();
+        final double fontB        = fd.fontB();
+        final boolean shadow      = fd.shadow();
 
-        int visiblePixels = 0; // must have at least one to be a valid match
+        FontSheet.GlyphDef bestGlyph     = null;
+        double             bestSizeScore = Double.MAX_VALUE;
+        double             bestScore     = 0.0;
 
-        for (int dy = 0; dy < gh; dy++, fontRowBase += fontStride * 4,
-                                        srcRowBase  += srcStride  * 4) {
-            for (int dx = 0; dx < gw; dx++) {
+        for (FontSheet.GlyphDef chr : fd.chars()) {
 
-                // ── Read font pixel ────────────────────────────────────────────
-                final int fOff  = fontRowBase + (dx * 4);
-                final int fontA = fontData[fOff + 3] & 0xFF;
+            if (chr.secondary() && !allowSecondary) continue;
 
-                // Transparent font pixel → skip (not part of glyph shape).
-                if (fontA == 0) continue;
+            final int[] pixels  = chr.pixels();
+            final int   nPixels = pixels.length / stride;
+            if (nPixels == 0) continue;
 
-                visiblePixels++;
+            // Alt1: sizescore = -chrobj.bonus + originalpixels * bonusperpixel
+            // chrobj.bonus = jsonNudge + bpp * N, so init = -jsonNudge
+            double score     = 0.0;
+            double sizeScore = -chr.bonus() + (double) nPixels * bpp;
+            int    checked   = 0;
+            boolean exceeded = false;
 
-                final int fontR = fontData[fOff]     & 0xFF;
-                final int fontG = fontData[fOff + 1] & 0xFF;
-                final int fontB = fontData[fOff + 2] & 0xFF;
+            for (int a = 0; a < pixels.length; a += stride) {
+                final int px       = pixels[a];
+                final int py       = pixels[a + 1];
+                final int strength = pixels[a + 2];
 
-                // ── Read source pixel ──────────────────────────────────────────
-                final int sOff = srcRowBase + (dx * 4);
-                final int srcR = srcData[sOff]     & 0xFF;
-                final int srcG = srcData[sOff + 1] & 0xFF;
-                final int srcB = srcData[sOff + 2] & 0xFF;
+                final int srcX = x + px;
+                final int srcY = y + py;
+                if (srcX < 0 || srcX >= srcWidth || srcY < 0 || srcY >= srcHeight) continue;
 
-                // ── coldif: per-channel absolute difference ────────────────────
-                // Short-circuit: return false on the first out-of-range channel.
-                final int deltaR = fontR - srcR;
-                final int deltaG = fontG - srcG;
-                final int deltaB = fontB - srcB;
+                final int off = (srcX + srcWidth * srcY) * 4;
+                final int rm  = srcData[off]     & 0xFF;
+                final int gm  = srcData[off + 1] & 0xFF;
+                final int bm  = srcData[off + 2] & 0xFF;
 
-                // Using conditional-free absolute value: (x ^ (x>>31)) - (x>>31)
-                // is equivalent to Math.abs(x) but avoids a branch on most JITs.
-                if (((deltaR ^ (deltaR >> 31)) - (deltaR >> 31)) > maxColorDistance) return false;
-                if (((deltaG ^ (deltaG >> 31)) - (deltaG >> 31)) > maxColorDistance) return false;
-                if (((deltaB ^ (deltaB >> 31)) - (deltaB >> 31)) > maxColorDistance) return false;
+                final double penalty;
+                if (shadow) {
+                    // Scale font colour by shadow luminance for this pixel.
+                    // Alt1: penalty = canblend(src, col*lum, col*lum, col*lum, strength/255)
+                    final double lum = pixels[a + 3] / 255.0;
+                    penalty = canblend(rm, gm, bm, fontR * lum, fontG * lum, fontB * lum, strength);
+                } else {
+                    penalty = canblend(rm, gm, bm, fontR, fontG, fontB, strength);
+                }
+
+                score     += penalty;
+                sizeScore += penalty - bpp;
+                checked++;
+
+                if (score > MAX_SCORE) {
+                    exceeded = true;
+                    break;
+                }
+            }
+
+            if (exceeded) continue;
+
+            // Reject if fewer than 60 % of template pixels were in-bounds and checked.
+            // Also reject very small glyphs (≤ 6 pixels) unless every pixel was checked.
+            if (checked < nPixels * 0.6) continue;
+            if (nPixels <= 6 && checked < nPixels) continue;
+
+            if (sizeScore < bestSizeScore) {
+                bestSizeScore = sizeScore;
+                bestScore     = score;
+                bestGlyph     = chr;
             }
         }
 
-        // A glyph with no visible pixels must not match arbitrary positions.
-        return visiblePixels > 0;
+        if (bestGlyph == null || bestScore > MAX_SCORE) return null;
+        return new CharMatch(bestGlyph, bestScore, bestSizeScore);
     }
+
+    // =========================================================================
+    // Internal: canblend
+    // =========================================================================
+
+    /**
+     * Determines whether the observed screen pixel {@code [rm, gm, bm]} is
+     * consistent with a blend of the font colour {@code [r1, g1, b1]} at
+     * proportion {@code strength/255} over some unknown background colour.
+     *
+     * <p>Port of Alt1's {@code canblend()} from {@code src/ocr/index.ts}:
+     * <pre>
+     *   p = strength / 255
+     *   m = min(50, p / (1 − p))
+     *   bg = screenPixel + (screenPixel − fontColour) × m   // extrapolated background
+     *   penalty = max(0, −bg.r, −bg.g, −bg.b, bg.r−255, bg.g−255, bg.b−255)
+     * </pre>
+     * A penalty of 0 means the required background colour falls inside
+     * {@code [0,255]³} — the observation is consistent with the font being
+     * present.  A positive penalty measures how far outside {@code [0,255]³}
+     * the implied background would lie, i.e. how implausible the match is.
+     *
+     * @param rm       observed red channel of the screen pixel
+     * @param gm       observed green channel
+     * @param bm       observed blue channel
+     * @param r1       effective font red channel (may be pre-scaled by shadow lum)
+     * @param g1       effective font green channel
+     * @param b1       effective font blue channel
+     * @param strength template pixel match strength [0–255]
+     * @return penalty ≥ 0 (0 = perfect plausibility)
+     */
+    private static double canblend(int rm, int gm, int bm,
+                                   double r1, double g1, double b1,
+                                   int strength) {
+        final double p = strength / 255.0;
+        // m = leverage: how far to extrapolate to reach the implied background.
+        // Capped at 50 to bound numerical extremes for strength near 255.
+        final double m = Math.min(50.0, p / (1.0 - p + 1e-9));
+
+        final double r = rm + (rm - r1) * m;
+        final double g = gm + (gm - g1) * m;
+        final double b = bm + (bm - b1) * m;
+
+        // Penalty = how far the implied background colour lies outside [0, 255]³.
+        return Math.max(0.0, Math.max(-r, Math.max(-g, Math.max(-b,
+                        Math.max(r - 255.0, Math.max(g - 255.0, b - 255.0))))));
+    }
+
+    // =========================================================================
+    // Private value type
+    // =========================================================================
+
+    /**
+     * Holds the result of a successful {@link #readChar} call.
+     *
+     * @param glyph     the winning {@link FontSheet.GlyphDef}
+     * @param score     raw accumulated penalty (≤ 400)
+     * @param sizeScore size-adjusted score used to rank multiple candidates
+     */
+    private record CharMatch(FontSheet.GlyphDef glyph, double score, double sizeScore) {}
 }
