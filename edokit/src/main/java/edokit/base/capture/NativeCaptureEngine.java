@@ -3,7 +3,7 @@ package edokit.base.capture;
 import com.sun.jna.Memory;
 import com.sun.jna.platform.win32.WinDef.HBITMAP;
 import com.sun.jna.platform.win32.WinDef.HDC;
-import com.sun.jna.platform.win32.WinDef.HGDIOBJ;
+import edokit.base.capture.jna.EdokitGdi32.HGDIOBJ;
 import com.sun.jna.platform.win32.WinDef.HWND;
 import com.sun.jna.platform.win32.WinDef.RECT;
 import com.sun.jna.platform.win32.WinGDI.BITMAPINFO;
@@ -336,7 +336,9 @@ public final class NativeCaptureEngine implements AutoCloseable {
 
         // Select our bitmap into the memory DC; save the default bitmap handle
         // so we can restore it before deleting the DC (mandatory to avoid leaks).
-        prevBitmap = GDI32.SelectObject(memDC, hBitmap);
+        // HBITMAP is wrapped as HGDIOBJ because SelectObject accepts any GDI
+        // object handle; our locally-defined HGDIOBJ bridges the JNA type gap.
+        prevBitmap = GDI32.SelectObject(memDC, new HGDIOBJ(hBitmap.getPointer()));
 
         // ── BITMAPINFO setup ──────────────────────────────────────────────────
         // Configure once per size; reused for every GetDIBits call on this size.
@@ -379,7 +381,7 @@ public final class NativeCaptureEngine implements AutoCloseable {
 
         // Step 2: Delete our capture bitmap (now safely deselected).
         if (hBitmap != null) {
-            GDI32.DeleteObject(hBitmap);
+            GDI32.DeleteObject(new HGDIOBJ(hBitmap.getPointer()));
             hBitmap = null;
         }
 

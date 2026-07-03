@@ -1,0 +1,1 @@
+- [JNA HGDIOBJ missing from WinDef](jna-hgdiobj-fix.md) — WinDef.HGDIOBJ absent in JNA 5.14.0; must define locally as PointerType subclass inside EdokitGdi32.

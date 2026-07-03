@@ -1,0 +1,42 @@
+### SYSTEM ARCHITECTURE CATCH-UP (PLEASE STORE IN-MEMORY FOR FUTURE SESSIONS)
+You are an elite Software Architect and Systems Engineer specializing in Computer Vision and high-performance native Java graphics pipelines. We are building "Edokit", a fast, native Java alternative to the Alt1 Toolkit for RuneScape interface detection. 
+
+Please absorb and permanently store the following module layout of our existing, locked-in architecture for all future development in this workspace:
+1. 'pom.xml': Configured with Java 17, JNA, and OpenCV bindings.
+2. 'edokit.base.models.EdokitImage': Manages flat 1D 'byte[] data' in interleaved RGBA format with zero-allocation 'pixelOffset' and 'cloneSubImage' methods to eliminate GC overhead.
+3. 'ImgRef' / 'HeapImgRef': Standardized image memory/pointer wrappers.
+4. 'EdokitImageLoader': Reads PNG assets and strips out embedded sRGB gamma profile variations to enforce exact color pixel evaluation across machines.
+5. 'NativeCaptureEngine': Binds to Windows User32/GDI32 via JNA to grab the "RuneScape" HWND back-buffer directly into a pre-allocated, recycled byte stream at 30+ FPS.
+6. 'SubImageMatcher': Runs OpenCV 'matchTemplate' (using TM_CCOEFF_NORMED) to discover coordinate bounds of anchors.
+7. 'FontSheet' & 'RasterOCR': Custom raster text recognition engine parsing Alt1-style .fontmeta.json definitions and uncompressed glyph sheets. Includes 'removeTextPixels' to mask and erase yellow timer text from the frame buffer prior to icon color evaluations.
+8. 'BuffReader': Dynamically discovers active buff cells using 'GRID_SIZE = 30' steps and uses a bitwise color-distance sampling algorithm ('countMatch') on specific pixel offsets to read active icons.
+
+---
+
+### CURRENT DIRECTIVE: IMPLEMENT INTEGRATION RUNNER
+We have successfully implemented all individual components. Your immediate task is to create the central orchestrator and coordinator class: 'edokit.engine.EdokitEngineRunner' containing a standard 'public static void main(String[] args)' entry point. This class ties all of our individual gears into a high-performance background tracking loop.
+
+Please write clean, robust Java code matching these exact technical specifications:
+
+#### Step 1: Initialization Sequence
+Inside the main method lifecycle, handle the initialization safely:
+1. Load Core Assets: Load the font definitions using our 'FontSheet.load()' method. Expect paths for the font JSON metadata and the font template PNG to be located inside the project's 'src/main/resources/fonts/' directory.
+2. Setup Buff Database: Initialize a default 'List<BuffDefinition>' array. For testing purposes, include a couple of dummy 'BuffDefinition' instances mapping realistic placeholder tracking coordinates (e.g., checking relative pixel indices inside the 27x27 grid).
+3. Initialize the Screen Grabber: Instantiate 'NativeCaptureEngine' targeting the window title "RuneScape".
+
+#### Step 2: The Core Game Capture Loop
+Create a background execution thread or while loop 'while (running)' structured as follows:
+1. Grab Live Frame: Call 'captureEngine.captureFrame()'. If the target window is missing, sleep the thread for 1000ms and retry gracefully.
+2. Anchor Detection (First Run or Intermittent Pass): 
+   - Full OpenCV template matching on every single frame is too heavy. Implement a state variable pipeline: 'boolean gridDiscovered = false; List<Rectangle> activeSlots = null;'.
+   - If 'gridDiscovered' is false, call 'SubImageMatcher.findSubimage()' targeting a sample anchor template (like an empty buff cell frame or the active prayer globe). Once coordinates are discovered, execute 'BuffReader.findBuffGrid()' to cache the list of 'Rectangle' slot bounds. Flip 'gridDiscovered = true'.
+   - Recalculate this anchor verification step only once every 150 frames (approx. 5 seconds) to handle instances where the user moves their game interface layout windows around, minimizing idle CPU overhead.
+3. Fast Path Core Reading (Every Frame):
+   - Pass the live 'EdokitImage' capture frame and the cached 'activeSlots' bounding layout straight into 'BuffReader.readBuffBar()'.
+   - Iterate through the returned 'List<TrackedBuff>' data. If any buffs are confirmed active, print their properties to the console in a readable format: '[Edokit Engine] Active Buff: "Overload" | Timer: "5:23" | Slot: 1'.
+4. Frame Pacing: Insert a small sleep utility at the bottom of the loop ('Thread.sleep(33);') to lock performance to a stable 30 frames per second.
+
+#### Step 3: Resource Lifecycle Shutdown Hook
+Register a JVM Shutdown Hook ('Runtime.getRuntime().addShutdownHook()') ensuring that if the application is killed or closed, it explicitly calls 'captureEngine.close()' or 'captureEngine.release()' to clean up native Windows graphical contexts (DCs, Bitmaps) and prevent dangerous unmanaged memory leaks.
+
+Ensure the code is production-ready, highly optimized, and contains no code stubs.

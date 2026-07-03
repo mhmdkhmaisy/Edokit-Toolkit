@@ -6,5 +6,7 @@
 /home/runner/workspace/edokit/src/main/java/edokit/base/models/HeapImgRef.java
 /home/runner/workspace/edokit/src/main/java/edokit/base/models/ImgRef.java
 /home/runner/workspace/edokit/src/main/java/edokit/base/vision/SubImageMatcher.java
+/home/runner/workspace/edokit/src/main/java/edokit/buffs/BuffReader.java
+/home/runner/workspace/edokit/src/main/java/edokit/engine/EdokitEngineRunner.java
 /home/runner/workspace/edokit/src/main/java/edokit/ocr/FontSheet.java
 /home/runner/workspace/edokit/src/main/java/edokit/ocr/RasterOCR.java

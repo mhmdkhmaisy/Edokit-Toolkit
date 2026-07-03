@@ -2,9 +2,9 @@ package edokit.base.capture.jna;
 
 import com.sun.jna.Native;
 import com.sun.jna.Pointer;
+import com.sun.jna.PointerType;
 import com.sun.jna.platform.win32.WinDef.HBITMAP;
 import com.sun.jna.platform.win32.WinDef.HDC;
-import com.sun.jna.platform.win32.WinDef.HGDIOBJ;
 import com.sun.jna.platform.win32.WinGDI.BITMAPINFO;
 import com.sun.jna.win32.StdCallLibrary;
 import com.sun.jna.win32.W32APIOptions;
@@ -40,6 +40,23 @@ public interface EdokitGdi32 extends StdCallLibrary {
     /** Singleton loaded once at class-init time. */
     EdokitGdi32 INSTANCE = Native.load("gdi32", EdokitGdi32.class,
             W32APIOptions.DEFAULT_OPTIONS);
+
+    /**
+     * Opaque handle to any GDI object (bitmap, pen, brush, font, region, etc.).
+     *
+     * <p>{@code HGDIOBJ} is not present in all JNA platform versions, so Edokit
+     * defines its own equivalent backed by a raw {@link Pointer}.  JNA marshals
+     * any {@link PointerType} subclass as a native pointer, which is exactly the
+     * Win32 ABI expectation for {@code HGDIOBJ} parameters and return values.
+     *
+     * <p>To convert a typed GDI handle (e.g. {@code HBITMAP}) to {@code HGDIOBJ}
+     * for use with {@link #SelectObject} or {@link #DeleteObject}, wrap its
+     * underlying pointer: {@code new HGDIOBJ(hBitmap.getPointer())}.
+     */
+    class HGDIOBJ extends PointerType {
+        public HGDIOBJ() {}
+        public HGDIOBJ(Pointer p) { super(p); }
+    }
 
     // =========================================================================
     // Raster-operation constants used with BitBlt
