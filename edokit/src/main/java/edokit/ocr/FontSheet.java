@@ -66,6 +66,27 @@ import java.util.Map;
  */
 public final class FontSheet {
 
+    /**
+     * Minimum channel value a pixel must exceed to be considered a visible glyph
+     * pixel during sprite-sheet column scanning.
+     *
+     * <h3>Rationale</h3>
+     * Alt1 font sprite sheets frequently include drop-shadow pixels that bleed
+     * into the otherwise-empty separator columns between glyphs.  Shadow pixels
+     * are rendered in dark tones (typical max RGB ≈ 20–60) while genuine glyph
+     * pixels are at the font's declared colour (e.g. {@code [255, 255, 255]} for
+     * white digits).  A threshold of {@code 100} cleanly partitions these two
+     * populations without touching anti-aliased glyph edges:
+     * <ul>
+     *   <li><b>Background / gap</b> (RGB = 0, or A = 0): always below threshold.</li>
+     *   <li><b>Shadow halo</b> (max channel ≈ 20–80): below threshold → ignored.</li>
+     *   <li><b>Glyph pixel</b> (max channel ≥ 127): above threshold → detected.</li>
+     * </ul>
+     * Applied to both the alpha-channel strategy (transparent-background sheets)
+     * and the RGB-channel strategy (opaque-background sheets).
+     */
+    private static final int GLYPH_VISIBILITY_THRESHOLD = 100;
+
     // =========================================================================
     // Public fields
     // =========================================================================
@@ -330,6 +351,10 @@ public final class FontSheet {
                     + "but \"chars\" declares %d.  The PNG may be clipped or "
                     + "contain fewer glyph runs than expected.%n",
                     fontName, charIndex, chars.length());
+        } else {
+            System.out.printf(
+                    "[FontSheet] \"%s\": successfully mapped %d/%d glyphs from sprite sheet.%n",
+                    fontName, charIndex, chars.length());
         }
     }
 
@@ -356,23 +381,32 @@ public final class FontSheet {
      * Returns {@code true} if every pixel in column {@code col} of the sprite
      * sheet is considered empty (not part of any rendered glyph).
      *
-     * <p>The emptiness criterion depends on the background strategy:
+     * <h3>Emptiness criterion</h3>
+     * A pixel is treated as a <em>visible glyph pixel</em> only when its
+     * relevant channel value exceeds {@link #GLYPH_VISIBILITY_THRESHOLD}:
      * <ul>
-     *   <li>{@code useAlpha = true}: pixel is empty when {@code A == 0}.</li>
-     *   <li>{@code useAlpha = false}: pixel is empty when
-     *       {@code R == 0 && G == 0 && B == 0} (solid black background).</li>
+     *   <li>{@code useAlpha = true} (transparent-background sheet): a pixel is
+     *       visible when {@code A > GLYPH_VISIBILITY_THRESHOLD}.  This rejects
+     *       fully-transparent gap pixels ({@code A == 0}) <em>and</em> dim shadow
+     *       halos ({@code A ≤ 100}) that bleed into separator columns.</li>
+     *   <li>{@code useAlpha = false} (opaque-background sheet): a pixel is visible
+     *       when any one of {@code R}, {@code G}, or {@code B} exceeds
+     *       {@code GLYPH_VISIBILITY_THRESHOLD}.  This rejects solid-black
+     *       background ({@code max(R,G,B) == 0}) and dark shadow pixels
+     *       ({@code max(R,G,B) ≤ 100}) while correctly detecting bright glyph
+     *       pixels ({@code max(R,G,B) ≥ 127}).</li>
      * </ul>
-     *
-     * <p>No objects are allocated here — every access is a direct index into
-     * the backing {@code byte[]} with a branch-free unsigned comparison.
+     * Pixel offset formula: {@code off = (col + imgWidth * row) * 4}, which is
+     * identical to {@code EdokitImage.pixelOffset(col, row)} and therefore
+     * directly compatible with every other pixel-level path in this pipeline.
      *
      * @param data      flat RGBA byte array from an {@link EdokitImage}
      * @param col       x-coordinate of the column to test (0-based)
      * @param imgWidth  sprite sheet width in pixels (used as row stride)
      * @param imgHeight sprite sheet height in pixels (number of rows to check)
-     * @param useAlpha  {@code true} to test the alpha channel;
-     *                  {@code false} to test RGB channels against black
-     * @return {@code true} if the entire column contains no glyph pixels
+     * @param useAlpha  {@code true} to gate on the alpha channel;
+     *                  {@code false} to gate on RGB channels
+     * @return {@code true} if no pixel in the column exceeds the visibility threshold
      */
     private static boolean isColumnEmpty(byte[] data,
                                          int col,
@@ -380,15 +414,22 @@ public final class FontSheet {
                                          int imgHeight,
                                          boolean useAlpha) {
         for (int row = 0; row < imgHeight; row++) {
+            // Pixel offset: identical to EdokitImage.pixelOffset(col, row).
+            // Expanding: (col + imgWidth * row) * 4 = 4*col + 4*imgWidth*row.
             final int off = (col + imgWidth * row) * 4;
             if (useAlpha) {
-                // Transparent-background: any non-zero alpha = glyph pixel present.
-                if ((data[off + 3] & 0xFF) != 0) return false;
+                // Transparent-background sheet.
+                // Shadow halos typically have A ≤ 80; genuine glyph pixels A ≥ 200.
+                // Threshold of 100 cleanly separates both without rejecting
+                // anti-aliased edge pixels (A ≈ 128–200).
+                if ((data[off + 3] & 0xFF) > GLYPH_VISIBILITY_THRESHOLD) return false;
             } else {
-                // Opaque-background: any non-zero RGB channel = glyph pixel present.
-                if ((data[off]     & 0xFF) != 0) return false;
-                if ((data[off + 1] & 0xFF) != 0) return false;
-                if ((data[off + 2] & 0xFF) != 0) return false;
+                // Opaque-background sheet (e.g. black-bg fonts, unblendmode=blackbg).
+                // Shadow pixels are dark (max channel ≈ 20–80); glyph pixels are bright.
+                // Any one channel above the threshold = glyph pixel present in this row.
+                if ((data[off]     & 0xFF) > GLYPH_VISIBILITY_THRESHOLD) return false;
+                if ((data[off + 1] & 0xFF) > GLYPH_VISIBILITY_THRESHOLD) return false;
+                if ((data[off + 2] & 0xFF) > GLYPH_VISIBILITY_THRESHOLD) return false;
             }
         }
         return true;

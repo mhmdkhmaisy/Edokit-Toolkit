@@ -1,0 +1,18 @@
+### CONTEXT SUMMARY (STORE IN MEMORY)
+We are running our main 'EdokitEngineRunner' entry loop. The JNA window hook and engine pipeline are operational at 30 FPS. However, during startup, we receive a critical tracking warning:
+"[FontSheet] Warning: 'Alt1 Font' sprite sheet yielded 1 glyph(s) but 'chars' declares 15. The PNG may be clipped or contain fewer glyph runs than expected."
+This indicates that while our metadata JSON root-key parser successfully maps the character coordinates, the texture-slicing code inside 'FontSheet.java' is discarding or failing to sample 14 out of the 15 font characters from 'pixel_8px_digits.data.png'.
+
+### CURRENT DIRECTIVE: FIX GLYPH EXTRACTION LOOP IN 'edokit.ocr.FontSheet.java'
+Audit and rewrite the internal glyph asset processing routine inside 'FontSheet.java' that converts raw sprite metrics ('x', 'y', 'width', 'height') into memory-mapped structures.
+
+1. Correct Sub-Image Offset Slicing:
+   - Ensure that when slicing a glyph from the loaded 'fontImage', your calculation handles the 1D interleaved RGBA array coordinates correctly without triggering out-of-bounds or mismatch exclusions.
+   - Verify that your pixel extraction loops map directly to:
+     int srcIdx = (fontImageX + x) * 4 + (fontImageY + y) * 4 * fontImageWidth;
+   - If the code contains any validation check that automatically discards a character if its pixels are pure black or transparent, remove or loosen that restriction. In Alt1 fonts, characters (especially numbers or spaces) may contain heavy transparent padding zones or single-color channels that simplistic transparency checkers accidentally reject.
+
+2. Eliminate Strict Dimension Truncation:
+   - Ensure the engine registers the character even if the bounding 'width' or 'height' spans only a few pixels (e.g., the digit '1' is often extremely thin). 
+
+Print a clean confirmation line showing the total number of characters mapped (it should match 15 glyphs) when completed. Do not introduce code stubs.
