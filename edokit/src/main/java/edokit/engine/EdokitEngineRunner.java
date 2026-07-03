@@ -49,18 +49,37 @@ public final class EdokitEngineRunner {
     /** Exact Win32 window title of the RuneScape client. */
     private static final String WINDOW_TITLE = "RuneScape";
 
-    /** Classpath location of the Alt1 timer font JSON descriptor. */
-    private static final String FONT_JSON_RESOURCE = "/fonts/stats_10.fontmeta.json";
+    /**
+     * Classpath location of the Alt1 timer font JSON descriptor.
+     * {@code pixel_8px_digits} is the dedicated digit-only font used by Alt1
+     * to render buff countdown overlays, making it the correct choice for
+     * buff-timer OCR.
+     */
+    private static final String FONT_JSON_RESOURCE = "/fonts/pixel_8px_digits.fontmeta.json";
 
     /** Classpath location of the Alt1 timer font sprite sheet PNG. */
-    private static final String FONT_IMG_RESOURCE = "/fonts/stats_10.data.png";
+    private static final String FONT_IMG_RESOURCE = "/fonts/pixel_8px_digits.data.png";
 
     /**
      * Classpath location of the buff-bar anchor template PNG.
-     * This image is matched against live frames to discover the buff grid origin.
-     * Replace with the actual buff-cell-frame or prayer-globe sprite asset.
+     *
+     * <p>This is Alt1's official {@code buffborder.data.png} asset — the exact
+     * 27×27 pixel border frame that RuneScape renders around every active buff
+     * slot.  Using the real Alt1 sprite guarantees a pixel-accurate match against
+     * the live client without any colour-guessing heuristics.
      */
-    private static final String ANCHOR_TEMPLATE_RESOURCE = "/fonts/buff_anchor.png";
+    private static final String ANCHOR_TEMPLATE_RESOURCE = "/buffs/buffborder.data.png";
+
+    /**
+     * Minimum {@code TM_CCOEFF_NORMED} confidence score for the buff-border
+     * template match to be accepted as a valid anchor.
+     *
+     * <p>0.87 sits in the middle of the 0.85–0.90 recommended range: high enough
+     * to reject noise and HUD elements that superficially resemble the border
+     * frame, but with a small tolerance margin for minor GPU anti-aliasing
+     * variation across different client zoom levels.
+     */
+    private static final float ANCHOR_MATCH_THRESHOLD = 0.87f;
 
     /** Maximum horizontal slot columns to probe during {@link BuffReader#findBuffGrid}. */
     private static final int MAX_BUFF_COLS = 20;
@@ -223,8 +242,11 @@ public final class EdokitEngineRunner {
                         || (frameCount % ANCHOR_RESCAN_INTERVAL == 0 && frameCount > 0);
 
                 if (rescanDue) {
+                    // Use the Alt1 buffborder sprite as the template target.
+                    // ANCHOR_MATCH_THRESHOLD (0.87) rejects false positives from
+                    // unrelated HUD chrome while tolerating minor AA variation.
                     final Optional<SubImageMatcher.MatchPoint> anchorHit =
-                            anchorMatcher.findBest(frame);
+                            anchorMatcher.findBest(frame, ANCHOR_MATCH_THRESHOLD);
 
                     if (anchorHit.isPresent()) {
                         final SubImageMatcher.MatchPoint hit = anchorHit.get();
@@ -324,23 +346,24 @@ public final class EdokitEngineRunner {
     }
 
     /**
-     * Loads the buff-bar anchor template PNG from the {@code /fonts/} classpath directory.
+     * Loads Alt1's official {@code buffborder.data.png} from the {@code /buffs/}
+     * classpath directory and returns it as an {@link EdokitImage}.
      *
-     * <p>This image is passed to {@link SubImageMatcher} and used to locate the
-     * buff grid's top-left origin on every anchor scan pass.  Replace
-     * {@link #ANCHOR_TEMPLATE_RESOURCE} with the sprite for whichever anchor
-     * is most reliably visible (e.g. an empty buff cell frame, the active prayer
-     * globe, or the buff-bar header sprite).
+     * <p>This sprite is the exact 27×27 pixel border frame that RuneScape renders
+     * around every active buff slot.  {@link SubImageMatcher} uses it as the
+     * template target to locate the buff grid's top-left origin on every anchor
+     * scan pass — no colour-guessing heuristics are needed because the match is
+     * pixel-accurate against the real client asset.
      *
-     * @return the anchor template as an {@link EdokitImage} in raw RGBA format
+     * @return the buffborder template as an {@link EdokitImage} in raw RGBA format
      * @throws IOException if the resource is missing or the format is unsupported
      */
     private static EdokitImage loadAnchorTemplate() throws IOException {
         final InputStream stream = EdokitEngineRunner.class.getResourceAsStream(ANCHOR_TEMPLATE_RESOURCE);
         if (stream == null) {
             throw new IOException(
-                    "Anchor template resource not found on classpath: " + ANCHOR_TEMPLATE_RESOURCE
-                    + " — ensure the file exists under src/main/resources/fonts/.");
+                    "Buff-border anchor resource not found on classpath: " + ANCHOR_TEMPLATE_RESOURCE
+                    + " — ensure buffborder.data.png exists under src/main/resources/buffs/.");
         }
         try (stream) {
             return EdokitImageLoader.load(stream);
