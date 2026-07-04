@@ -314,8 +314,11 @@ public final class BuffReader {
                 }
             }
 
-            // ── Step C: colour-fingerprint match against the known buff database ──
-            if (database != null) {
+            // ── Step C: colour-fingerprint match, or count-only mode ─────────────
+            // When database is null or empty every discovered slot is reported by
+            // its grid position — useful for counting active buffs without needing
+            // pre-defined fingerprints.
+            if (database != null && !database.isEmpty()) {
                 for (int d = 0; d < database.size(); d++) {
                     final BuffDefinition def = database.get(d);
                     if (countMatch(screenFrame, slot, def, colorTolerance)) {
@@ -323,6 +326,8 @@ public final class BuffReader {
                         break; // first matching definition wins this slot
                     }
                 }
+            } else {
+                tracked.add(new TrackedBuff(i, "Slot " + (i + 1), timerText));
             }
         }
 
