@@ -306,7 +306,7 @@ public final class BuffReader {
             final int ocrY = slot.y + (slot.height / 2);
             String timerText = "";
             if (timerFont != null) {
-                timerText = ocr.readLine(screenFrame, ocrX, ocrY, timerFont, colorTolerance);
+                timerText = ocr.readLine(screenFrame, ocrX, ocrY, timerFont);
 
                 // ── Step B: mask the recognised digits out of the live frame ───────
                 if (!timerText.isEmpty()) {
