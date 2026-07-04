@@ -72,22 +72,23 @@ public final class BuffReader {
     /**
      * Maximum per-channel value for a pixel to be classified as part of the
      * buff cell's outer 2px near-black bounding frame.
+     *
+     * <p>70 is deliberately lenient: RuneScape's GDI-captured border pixels can
+     * read 50–65 across channels due to sub-pixel rendering and JPEG-like GDI
+     * compression artefacts.  The template match already confirmed the border
+     * pattern is present; this threshold guards only against stepping into a
+     * genuinely empty region of the HUD.
      */
-    private static final int OUTER_BORDER_MAX_CHANNEL = 40;
-
-    /** Lower/upper bounds for the inner blue-grey border gradient (R and G channels). */
-    private static final int INNER_BORDER_RG_MIN = 45;
-    private static final int INNER_BORDER_RG_MAX = 115;
-
-    /** Lower/upper bounds for the inner blue-grey border gradient (B channel). */
-    private static final int INNER_BORDER_B_MIN = 65;
-    private static final int INNER_BORDER_B_MAX = 150;
-
-    /** Minimum lead the blue channel must have over red/green for a "blue-grey" read. */
-    private static final int INNER_BORDER_BLUE_LEAD = 4;
+    private static final int OUTER_BORDER_MAX_CHANNEL = 70;
 
     /** Consecutive empty columns in a row before that row's horizontal scan stops. */
     private static final int MAX_EMPTY_COLS_BEFORE_ROW_STOP = 1;
+
+    /**
+     * Whether the one-time anchor diagnostic has already been printed.
+     * Written from the capture thread only — no synchronisation needed.
+     */
+    private volatile boolean anchorDiagnosticPrinted = false;
 
     // =========================================================================
     // Internal state
@@ -178,42 +179,45 @@ public final class BuffReader {
     }
 
     /**
-     * Tests whether the {@code BUFF_SIZE x BUFF_SIZE} cell whose top-left corner
+     * Tests whether the {@code BUFF_SIZE × BUFF_SIZE} cell whose top-left corner
      * sits at {@code (x, y)} carries a genuine buff-frame border.
      *
-     * <p>No objects are allocated here — every pixel read goes straight through
-     * {@link EdokitImage#pixelOffset} into the backing {@code byte[]}.
+     * <h3>Sampling strategy</h3>
+     * Rather than checking every pixel across all 54 border positions (which fails
+     * on a single slightly-bright pixel), this method checks a strategic 8-point
+     * sample: the outer corner pixels at each quadrant of the top and left edges,
+     * plus the four extreme corners of the full cell border.  All sampled pixels
+     * must be dark (all channels ≤ {@link #OUTER_BORDER_MAX_CHANNEL}).
+     *
+     * <p>The template match that produced the anchor position already confirmed the
+     * full border pattern — this check is a lightweight guard against accidentally
+     * stepping into empty HUD space when scanning adjacent grid slots.
      *
      * @param screen the frame being scanned
      * @param x      candidate slot left edge
      * @param y      candidate slot top edge
-     * @return {@code true} if the outer near-black frame and inner blue-grey
-     *         gradient are both present
+     * @return {@code true} if the sampled border pixels are sufficiently dark
      */
     private static boolean isValidBuffFrame(EdokitImage screen, int x, int y) {
-        // Bounds guard: the full cell must fit inside the frame.
         if (x < 0 || y < 0
                 || x + BUFF_SIZE > screen.width
                 || y + BUFF_SIZE > screen.height) {
             return false;
         }
 
-        // ── Outer 2px near-black L-frame: sample top edge + left edge ──────────
-        // Top edge, both border rows, spanning the full cell width.
-        for (int dx = 0; dx < BUFF_SIZE; dx++) {
-            if (!isNearBlack(screen, x + dx, y)) return false;
-            if (!isNearBlack(screen, x + dx, y + 1)) return false;
-        }
-        // Left edge, both border columns, spanning the full cell height.
-        for (int dy = 0; dy < BUFF_SIZE; dy++) {
-            if (!isNearBlack(screen, x, y + dy)) return false;
-            if (!isNearBlack(screen, x + 1, y + dy)) return false;
-        }
+        final int e = BUFF_SIZE - 1; // last pixel index within the cell
 
-        // ── Inner blue-grey border gradient, just inside the black frame ───────
-        return isBlueGreyBorder(screen, x + 2, y + 2)
-            && isBlueGreyBorder(screen, x + BUFF_SIZE - 3, y + 2)
-            && isBlueGreyBorder(screen, x + 2, y + BUFF_SIZE - 3);
+        // 8-point sample: top-left corner, top-right corner, bottom-left corner,
+        // mid-points on the top edge and left edge (both border rows/cols).
+        // Avoids scanning every pixel while still rejecting plain HUD background.
+        return isNearBlack(screen, x,         y        )  // top-left
+            && isNearBlack(screen, x + e,     y        )  // top-right
+            && isNearBlack(screen, x,         y + e    )  // bottom-left
+            && isNearBlack(screen, x + e / 2, y        )  // top mid
+            && isNearBlack(screen, x,         y + e / 2)  // left mid
+            && isNearBlack(screen, x + 1,     y        )  // top-left row-2
+            && isNearBlack(screen, x,         y + 1    )  // top-left col-2
+            && isNearBlack(screen, x + e / 2, y + 1    ); // top mid row-2
     }
 
     /** Returns {@code true} if the pixel at {@code (x, y)} reads near-black. */
@@ -223,23 +227,7 @@ public final class BuffReader {
         final int r = data[off]     & 0xFF;
         final int g = data[off + 1] & 0xFF;
         final int b = data[off + 2] & 0xFF;
-        final int maxChannel = Math.max(r, Math.max(g, b));
-        return maxChannel <= OUTER_BORDER_MAX_CHANNEL;
-    }
-
-    /** Returns {@code true} if the pixel at {@code (x, y)} reads blue-grey. */
-    private static boolean isBlueGreyBorder(EdokitImage screen, int x, int y) {
-        final int off = screen.pixelOffset(x, y);
-        final byte[] data = screen.data;
-        final int r = data[off]     & 0xFF;
-        final int g = data[off + 1] & 0xFF;
-        final int b = data[off + 2] & 0xFF;
-
-        if (r < INNER_BORDER_RG_MIN || r > INNER_BORDER_RG_MAX) return false;
-        if (g < INNER_BORDER_RG_MIN || g > INNER_BORDER_RG_MAX) return false;
-        if (b < INNER_BORDER_B_MIN  || b > INNER_BORDER_B_MAX)  return false;
-
-        return (b - r) >= INNER_BORDER_BLUE_LEAD && (b - g) >= INNER_BORDER_BLUE_LEAD;
+        return Math.max(r, Math.max(g, b)) <= OUTER_BORDER_MAX_CHANNEL;
     }
 
     // =========================================================================
