@@ -242,34 +242,60 @@ public final class EdokitEngineRunner {
                         || (frameCount % ANCHOR_RESCAN_INTERVAL == 0 && frameCount > 0);
 
                 if (rescanDue) {
-                    // Use the Alt1 buffborder sprite as the template target.
-                    // ANCHOR_MATCH_THRESHOLD (0.87) rejects false positives from
-                    // unrelated HUD chrome while tolerating minor AA variation.
+                    // ── DEBUG: run at relaxed threshold so we always see the best
+                    // match the CV engine finds, even when it is far below production
+                    // quality.  Replace 0.40f with ANCHOR_MATCH_THRESHOLD once the
+                    // correct confidence range has been confirmed.
+                    final float DEBUG_RELAXED_THRESHOLD = 0.40f;
                     final Optional<SubImageMatcher.MatchPoint> anchorHit =
-                            anchorMatcher.findBest(frame, ANCHOR_MATCH_THRESHOLD);
+                            anchorMatcher.findBest(frame, DEBUG_RELAXED_THRESHOLD);
 
                     if (anchorHit.isPresent()) {
                         final SubImageMatcher.MatchPoint hit = anchorHit.get();
 
-                        // Derive the buff grid's top-left origin from the anchor match.
-                        final List<Rectangle> discovered =
-                                buffReader.findBuffGrid(frame, hit.x(), hit.y(),
-                                        MAX_BUFF_COLS, MAX_BUFF_ROWS);
+                        // Always log the raw CV result so we can see the true confidence
+                        // distribution regardless of whether it meets the production bar.
+                        System.out.printf(
+                                "[Edokit Debug] Best match confidence found on screen: %.4f at (X: %d, Y: %d)%n",
+                                hit.confidence(), hit.x(), hit.y());
 
-                        if (!discovered.isEmpty()) {
-                            activeSlots    = discovered;
-                            gridDiscovered = true;
-                            System.out.println("[Edokit Engine] Buff grid discovered at ("
-                                    + hit.x() + ", " + hit.y() + ") — "
-                                    + activeSlots.size() + " active slot(s) cached. "
-                                    + "(confidence=" + String.format("%.4f", hit.confidence()) + ")");
+                        if (hit.confidence() >= ANCHOR_MATCH_THRESHOLD) {
+                            // Confidence meets the production threshold — attempt grid discovery.
+                            final List<Rectangle> discovered =
+                                    buffReader.findBuffGrid(frame, hit.x(), hit.y(),
+                                            MAX_BUFF_COLS, MAX_BUFF_ROWS);
+
+                            if (!discovered.isEmpty()) {
+                                activeSlots    = discovered;
+                                gridDiscovered = true;
+                                System.out.println("[Edokit Engine] Buff grid discovered at ("
+                                        + hit.x() + ", " + hit.y() + ") — "
+                                        + activeSlots.size() + " active slot(s) cached. "
+                                        + "(confidence=" + String.format("%.4f", hit.confidence()) + ")");
+                            } else {
+                                // Anchor confidence passed but the border heuristic found
+                                // no occupied buff slots — bar may be empty or the anchor
+                                // coordinate is offset.
+                                System.err.printf(
+                                        "[Edokit Debug] Anchor matched with %.4f confidence, but "
+                                        + "findBuffGrid failed to discover valid occupied slots "
+                                        + "at this coordinate location.%n",
+                                        hit.confidence());
+                                activeSlots    = null;
+                                gridDiscovered = false;
+                            }
                         } else {
-                            // Anchor found but no occupied slots detected — bar may be empty.
+                            // Best match exists but is below production threshold —
+                            // do not update the grid; keep whatever was cached.
                             activeSlots    = null;
                             gridDiscovered = false;
                         }
                     } else {
-                        // Anchor not found in this frame — grid location unknown.
+                        // Nothing above the relaxed floor — template is not present
+                        // in the frame at any plausible confidence.
+                        System.out.printf(
+                                "[Edokit Debug] Best match confidence found on screen: <none above %.2f> at (X: N/A, Y: N/A)%n",
+                                DEBUG_RELAXED_THRESHOLD);
                         if (gridDiscovered) {
                             System.err.println("[Edokit Engine] Anchor lost — "
                                     + "will retry on next rescan interval.");
