@@ -74,12 +74,13 @@ public final class EdokitEngineRunner {
      * Minimum {@code TM_CCOEFF_NORMED} confidence score for the buff-border
      * template match to be accepted as a valid anchor.
      *
-     * <p>0.87 sits in the middle of the 0.85–0.90 recommended range: high enough
-     * to reject noise and HUD elements that superficially resemble the border
-     * frame, but with a small tolerance margin for minor GPU anti-aliasing
-     * variation across different client zoom levels.
+     * <p>0.85 sits in the practical range for game UI assets with the alpha-mask
+     * path active: transparent interior pixels are excluded from the correlation,
+     * so the score reflects only the border pixels that actually appear on screen.
+     * This eliminates the need to drop below 0.80 to compensate for the old
+     * transparent-interior poisoning problem.
      */
-    private static final float ANCHOR_MATCH_THRESHOLD = 0.60f;
+    private static final float ANCHOR_MATCH_THRESHOLD = 0.85f;
 
     /** Maximum horizontal slot columns to probe during {@link BuffReader#findBuffGrid}. */
     private static final int MAX_BUFF_COLS = 20;

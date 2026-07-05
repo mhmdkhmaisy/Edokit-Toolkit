@@ -20,6 +20,25 @@ import java.util.Optional;
  * {@code TM_CCOEFF_NORMED} algorithm, then applying non-maximum suppression (NMS) to
  * return only genuine, spatially distinct matches above a confidence threshold.
  *
+ * <h2>Alpha-mask handling</h2>
+ * When the template PNG has an alpha channel (e.g. {@code buffborder.data.png}),
+ * transparent interior pixels must NOT participate in the correlation — otherwise
+ * OpenCV's {@code COLOR_RGBA2GRAY} maps them to black (0) and the match score
+ * collapses because the live screen has non-black icon content at those positions.
+ *
+ * <p>This class solves that by:
+ * <ol>
+ *   <li>Extracting the alpha channel from the template RGBA Mat into a dedicated
+ *       {@code templateMask} (CV_8UC1, 0=exclude / 255=include).</li>
+ *   <li>Zeroing out the grayscale template pixels wherever the mask is 0, so the
+ *       grayscale template is fully consistent with the mask.</li>
+ *   <li>Passing {@code templateMask} as the 5th argument to {@code matchTemplate}
+ *       when any non-zero mask pixels exist.  {@code TM_CCOEFF_NORMED} with a mask
+ *       ignores masked-out pixels during both template and image normalisation.</li>
+ * </ol>
+ * If every mask pixel is 255 (fully opaque template), the mask path is skipped and
+ * the standard 4-argument {@code matchTemplate} is used instead.
+ *
  * <h2>Memory strategy</h2>
  * OpenCV stores {@code Mat} data in native (off-heap) memory.  This class minimises
  * the number of native allocations by:
@@ -34,8 +53,7 @@ import java.util.Optional;
  *
  * <p><b>Java heap → native Mat transfer:</b> {@code EdokitImage.data} is a Java
  * {@code byte[]} living on the JVM heap; OpenCV {@code Mat} data lives in native
- * (off-heap) memory.  The standard OpenCV Java binding provides no way to pin a
- * Java array into native memory without a copy.  The transfer is performed via
+ * (off-heap) memory.  The transfer is performed via
  * {@code Mat.put(0, 0, byte[])}, which delegates to a single JNI {@code memcpy}
  * call — one copy per frame at the native layer, with no intermediate Java-level
  * array allocation.
@@ -47,9 +65,10 @@ import java.util.Optional;
  *       ├─ srcMat.put()        → srcMat   (CV_8UC4, native)
  *       │  cvtColor RGBA→GRAY  → srcGray  (CV_8UC1, native)
  *       │
- *       └─ (template)          → templateGray (CV_8UC1, pre-loaded)
+ *       └─ (template)          → templateGray (CV_8UC1, pre-loaded, zeros at α=0)
+ *                               → templateMask (CV_8UC1, alpha channel, or null if opaque)
  *
- *   matchTemplate(srcGray, templateGray, resultMat, TM_CCOEFF_NORMED)
+ *   matchTemplate(srcGray, templateGray, resultMat, TM_CCOEFF_NORMED[, templateMask])
  *       → resultMat (CV_32FC1, values in [-1.0, +1.0])
  *
  *   resultMat.get() → resultBuffer (float[], Java heap)
@@ -58,7 +77,7 @@ import java.util.Optional;
  *
  * <h2>Usage</h2>
  * <pre>{@code
- *   EdokitImage template = EdokitImageLoader.load(new File("prayer_globe.png"));
+ *   EdokitImage template = EdokitImageLoader.load(new File("buffborder.data.png"));
  *
  *   try (SubImageMatcher matcher = new SubImageMatcher(template)) {
  *       // Inside your capture loop:
@@ -107,11 +126,13 @@ public final class SubImageMatcher implements AutoCloseable {
      * Default confidence threshold for {@link #findAll(EdokitImage)} and
      * {@link #findBest(EdokitImage)}.
      *
-     * <p>0.90 corresponds to a 90% normalised cross-correlation score.  For
-     * pixel-perfect game UI assets this is conservative; raise to 0.95–0.98
-     * if false positives appear against patterned backgrounds.
+     * <p>0.85 provides a practical balance for game UI assets: high enough to
+     * reject noise, with a small margin for minor GPU anti-aliasing variation
+     * across different client zoom levels.  The alpha-mask path eliminates the
+     * need to drop this below 0.80 just to compensate for transparent-interior
+     * template poisoning.
      */
-    public static final float DEFAULT_THRESHOLD = 0.90f;
+    public static final float DEFAULT_THRESHOLD = 0.85f;
 
     // =========================================================================
     // Template state (allocated once, immutable after construction)
@@ -125,15 +146,27 @@ public final class SubImageMatcher implements AutoCloseable {
 
     /**
      * RGBA template Mat (CV_8UC4).  Kept alive to allow future colour-mode
-     * extensions; currently only the grayscale version is used for matching.
+     * extensions; currently the grayscale and mask versions are derived from it.
      */
     private final Mat templateRGBA;
 
     /**
-     * Grayscale template Mat (CV_8UC1).  This is the actual operand passed to
-     * {@code matchTemplate} on every call — allocated once, never changed.
+     * Grayscale template Mat (CV_8UC1).  Transparent pixels (alpha=0) are
+     * zeroed out after RGBA→GRAY conversion so they do not contribute spurious
+     * correlation energy when the mask path is active.
      */
     private final Mat templateGray;
+
+    /**
+     * Alpha-channel mask Mat (CV_8UC1), or {@code null} if the template is
+     * fully opaque.  When non-null, every pixel whose alpha=0 has value 0
+     * (exclude from match); alpha=255 pixels have value 255 (include).
+     *
+     * <p>Passed as the optional 5th argument to {@code Imgproc.matchTemplate}
+     * with {@code TM_CCOEFF_NORMED}, which honours masks for both CCOEFF and
+     * CCORR normalised methods.
+     */
+    private final Mat templateMask; // null = fully opaque → standard 4-arg matchTemplate
 
     // =========================================================================
     // Source and result state (lazily allocated, reused per source resolution)
@@ -157,10 +190,11 @@ public final class SubImageMatcher implements AutoCloseable {
     /**
      * Builds a matcher pre-loaded with the supplied template image.
      *
-     * <p>The template's pixels are converted to grayscale and stored in native
-     * OpenCV memory immediately.  All subsequent calls to {@link #findAll} and
-     * {@link #findBest} reuse this native Mat — the template conversion cost is
-     * paid exactly once.
+     * <p>If the template contains any pixel with alpha &lt; 255, an alpha-mask
+     * Mat is extracted and retained.  The grayscale template has its transparent
+     * pixel positions zeroed so it is fully consistent with the mask.  All
+     * subsequent {@link #findAll}/{@link #findBest} calls use the masked
+     * {@code matchTemplate} path automatically.
      *
      * @param template the image to search for; must not be {@code null} and must
      *                 have positive, non-zero dimensions
@@ -176,15 +210,29 @@ public final class SubImageMatcher implements AutoCloseable {
         this.templateWidth  = template.width;
         this.templateHeight = template.height;
 
-        // Allocate native Mats for the template.
+        // ── 1. Load RGBA template into native memory ──────────────────────────
         templateRGBA = new Mat(template.height, template.width, CvType.CV_8UC4);
-        templateGray = new Mat(template.height, template.width, CvType.CV_8UC1);
-
-        // Push template pixels into native memory (single JNI memcpy).
         templateRGBA.put(0, 0, template.data);
 
-        // Convert RGBA → grayscale once; stored permanently in templateGray.
+        // ── 2. Convert to grayscale ───────────────────────────────────────────
+        //    COLOR_RGBA2GRAY = 0.299R + 0.587G + 0.114B, alpha is IGNORED.
+        //    Transparent pixels (R=G=B=A=0) → gray=0 (black).  We correct this
+        //    after extracting the mask.
+        templateGray = new Mat(template.height, template.width, CvType.CV_8UC1);
         Imgproc.cvtColor(templateRGBA, templateGray, Imgproc.COLOR_RGBA2GRAY);
+
+        // ── 3. Build alpha mask and zero-correct the grayscale template ────────
+        //    Scan the raw RGBA bytes to determine whether ANY pixel is transparent.
+        //    If so, extract the alpha channel into a dedicated mask Mat and set
+        //    the corresponding grayscale pixels to 0.
+        final Mat mask = buildAlphaMask(template, templateGray);
+        this.templateMask = mask; // null if fully opaque
+
+        System.out.printf(
+                "[SubImageMatcher] Template %dx%d loaded — alpha mask: %s%n",
+                templateWidth, templateHeight,
+                (mask != null ? "ACTIVE (transparent pixels excluded from match)"
+                              : "none (fully opaque)"));
     }
 
     /**
@@ -211,39 +259,28 @@ public final class SubImageMatcher implements AutoCloseable {
      *
      * @param source    the live frame to search within
      * @param threshold minimum normalised correlation score in [0.0, 1.0];
-     *                  use {@link #DEFAULT_THRESHOLD} (0.90) if unsure
+     *                  use {@link #DEFAULT_THRESHOLD} (0.85) if unsure
      * @return unmodifiable list of distinct match locations; empty if none found
      * @throws IllegalArgumentException if threshold is outside [0.0, 1.0]
      */
     public List<MatchPoint> findAll(EdokitImage source, float threshold) {
         validateThreshold(threshold);
 
-        // Template larger than source → impossible match.
         if (source.width < templateWidth || source.height < templateHeight) {
             return Collections.emptyList();
         }
 
-        // Allocate or reuse native Mats sized to this source resolution.
         ensureSourceMatsAllocated(source.width, source.height);
 
-        // ── Transfer + convert source ─────────────────────────────────────────
-        // mat.put() is a single JNI memcpy; no intermediate Java array is created.
         srcRGBA.put(0, 0, source.data);
         Imgproc.cvtColor(srcRGBA, srcGray, Imgproc.COLOR_RGBA2GRAY);
 
-        // ── Template matching ─────────────────────────────────────────────────
-        // resultMat is pre-allocated to the correct size; matchTemplate will
-        // reuse its native storage without triggering a GDI reallocation.
-        Imgproc.matchTemplate(srcGray, templateGray, resultMat, Imgproc.TM_CCOEFF_NORMED);
+        runMatchTemplate();
 
-        // ── Read result into Java heap ────────────────────────────────────────
-        // resultMat.get() copies the entire float matrix to our pre-allocated
-        // resultBuffer in one JNI call.
         final int resultRows = resultMat.rows();
         final int resultCols = resultMat.cols();
         resultMat.get(0, 0, resultBuffer);
 
-        // ── Extract local peaks above threshold (with NMS) ────────────────────
         return extractPeaks(resultBuffer, resultRows, resultCols, threshold);
     }
 
@@ -280,10 +317,9 @@ public final class SubImageMatcher implements AutoCloseable {
 
         srcRGBA.put(0, 0, source.data);
         Imgproc.cvtColor(srcRGBA, srcGray, Imgproc.COLOR_RGBA2GRAY);
-        Imgproc.matchTemplate(srcGray, templateGray, resultMat, Imgproc.TM_CCOEFF_NORMED);
 
-        // Core.minMaxLoc allocates one MinMaxLocResult (cheap) but avoids
-        // reading the entire result matrix into Java heap.
+        runMatchTemplate();
+
         Core.MinMaxLocResult mmr = Core.minMaxLoc(resultMat);
 
         if (mmr.maxVal < threshold) {
@@ -322,14 +358,69 @@ public final class SubImageMatcher implements AutoCloseable {
      */
     @Override
     public void close() {
-        // Template Mats (always allocated).
         templateRGBA.release();
         templateGray.release();
+        if (templateMask != null) templateMask.release();
 
-        // Source and result Mats (null until first findAll/findBest call).
         if (srcRGBA   != null) srcRGBA.release();
         if (srcGray   != null) srcGray.release();
         if (resultMat != null) resultMat.release();
+    }
+
+    // =========================================================================
+    // Internal: alpha mask construction
+    // =========================================================================
+
+    /**
+     * Scans the raw RGBA bytes of {@code template} to determine whether any pixel
+     * has alpha &lt; 255.  If so, builds a CV_8UC1 mask Mat (0 = transparent /
+     * excluded, 255 = opaque / included) and zeroes out the corresponding pixels
+     * in {@code grayMat} so the template is consistent with the mask.
+     *
+     * <p>If all pixels are fully opaque, returns {@code null} — the standard
+     * 4-argument {@code matchTemplate} is used and no mask overhead is paid.
+     *
+     * @param template source RGBA image
+     * @param grayMat  the already-converted grayscale Mat to mutate in place
+     * @return the mask Mat, or {@code null} if the template is fully opaque
+     */
+    private static Mat buildAlphaMask(EdokitImage template, Mat grayMat) {
+        final int w = template.width;
+        final int h = template.height;
+        final byte[] rgba = template.data;
+        final int nPix = w * h;
+
+        // Build mask byte array in a single pass.
+        // Also collect a zeroed grayscale patch for transparent positions.
+        final byte[] maskBytes = new byte[nPix];
+        final byte[] grayPatch = new byte[nPix]; // read-modify-write into grayMat
+
+        grayMat.get(0, 0, grayPatch); // pull existing grayscale into Java heap
+
+        boolean anyTransparent = false;
+        for (int i = 0, src = 3; i < nPix; i++, src += 4) { // src points at alpha channel
+            final int alpha = rgba[src] & 0xFF;
+            if (alpha < 255) {
+                anyTransparent = true;
+                maskBytes[i]   = 0;       // exclude from match
+                grayPatch[i]   = 0;       // zero the grayscale value at this position
+            } else {
+                maskBytes[i]   = (byte) 255; // include in match
+                // grayPatch[i] already holds the correct grayscale value
+            }
+        }
+
+        if (!anyTransparent) {
+            return null; // template is fully opaque — no mask needed
+        }
+
+        // Push the corrected grayscale back (only the zeroed positions changed).
+        grayMat.put(0, 0, grayPatch);
+
+        // Allocate and populate the mask Mat.
+        final Mat mask = new Mat(h, w, CvType.CV_8UC1);
+        mask.put(0, 0, maskBytes);
+        return mask;
     }
 
     // =========================================================================
@@ -340,18 +431,12 @@ public final class SubImageMatcher implements AutoCloseable {
      * Ensures that {@link #srcRGBA}, {@link #srcGray}, {@link #resultMat}, and
      * {@link #resultBuffer} are allocated and sized for a source of
      * {@code srcW × srcH} pixels.
-     *
-     * <p>On the first call, all four objects are allocated.  On subsequent calls
-     * at the same resolution, this method returns immediately (O(1) check).  If
-     * the source resolution changes (e.g. window resize), the old native Mats are
-     * explicitly released before the new ones are allocated — no native leak.
      */
     private void ensureSourceMatsAllocated(int srcW, int srcH) {
         if (srcW == cachedSrcWidth && srcH == cachedSrcHeight) {
-            return; // steady state — zero work
+            return;
         }
 
-        // Release stale native resources before reallocating.
         if (srcRGBA   != null) srcRGBA.release();
         if (srcGray   != null) srcGray.release();
         if (resultMat != null) resultMat.release();
@@ -363,11 +448,28 @@ public final class SubImageMatcher implements AutoCloseable {
         srcGray   = new Mat(srcH, srcW,   CvType.CV_8UC1);
         resultMat = new Mat(resultH, resultW, CvType.CV_32FC1);
 
-        // Pre-allocate the Java-heap read buffer for the result matrix.
         resultBuffer = new float[resultW * resultH];
 
         cachedSrcWidth  = srcW;
         cachedSrcHeight = srcH;
+    }
+
+    /**
+     * Runs {@code Imgproc.matchTemplate} using the alpha mask when available.
+     *
+     * <p>When {@link #templateMask} is non-null (template has transparent pixels),
+     * the 5-argument overload is used so that masked-out pixels are excluded from
+     * both template and image normalisation.  When null (fully opaque template),
+     * the standard 4-argument overload is used to avoid any overhead.
+     */
+    private void runMatchTemplate() {
+        if (templateMask != null) {
+            Imgproc.matchTemplate(srcGray, templateGray, resultMat,
+                                  Imgproc.TM_CCOEFF_NORMED, templateMask);
+        } else {
+            Imgproc.matchTemplate(srcGray, templateGray, resultMat,
+                                  Imgproc.TM_CCOEFF_NORMED);
+        }
     }
 
     // =========================================================================
@@ -383,19 +485,6 @@ public final class SubImageMatcher implements AutoCloseable {
      *       template dimensions — i.e., no neighbouring pixel in that window
      *       has a higher score.</li>
      * </ol>
-     *
-     * <h3>NMS neighbourhood size</h3>
-     * The suppression window is {@code ±templateWidth} columns × {@code ±templateHeight}
-     * rows around each candidate.  This ensures that two returned matches are
-     * always at least one full template-width apart horizontally and one
-     * template-height apart vertically — preventing duplicate detections of the
-     * same UI element.
-     *
-     * @param data      flattened float array from {@code resultMat.get(0, 0, data)}
-     * @param rows      number of rows in the result matrix
-     * @param cols      number of columns in the result matrix
-     * @param threshold minimum score for a candidate to be considered
-     * @return list of confirmed peaks as {@link MatchPoint} instances
      */
     private List<MatchPoint> extractPeaks(float[] data, int rows, int cols, float threshold) {
         final List<MatchPoint> peaks = new ArrayList<>();
@@ -404,13 +493,9 @@ public final class SubImageMatcher implements AutoCloseable {
             for (int col = 0; col < cols; col++) {
                 final float val = data[row * cols + col];
 
-                // Fast rejection: skip anything below threshold before the NMS scan.
                 if (val < threshold) continue;
 
-                // Confirm this pixel is a local maximum in the template-sized window.
                 if (isLocalMaximum(data, rows, cols, row, col)) {
-                    // (col, row) in result space = top-left corner of the match
-                    // in source image space (result position maps 1:1 to source pixel).
                     peaks.add(new MatchPoint(col, row, val));
                 }
             }
@@ -423,35 +508,19 @@ public final class SubImageMatcher implements AutoCloseable {
      * Returns {@code true} if the pixel at {@code (row, col)} has the highest
      * value within the suppression neighbourhood of size
      * {@code ±templateWidth × ±templateHeight}.
-     *
-     * <p>The scan uses a flat index into {@code data} (row-major) to avoid
-     * 2D array overhead.  The check short-circuits on the first neighbour found
-     * with a strictly higher value — no need to scan the entire window once a
-     * disqualifier is found.
-     *
-     * @param data   flattened result matrix (row-major)
-     * @param rows   total rows in the result matrix (bounds for clamping)
-     * @param cols   total columns in the result matrix (bounds for clamping)
-     * @param row    candidate row index
-     * @param col    candidate column index
-     * @return {@code true} if this position is the local maximum
      */
     private boolean isLocalMaximum(float[] data, int rows, int cols, int row, int col) {
         final float center = data[row * cols + col];
 
-        // Clamp neighbourhood bounds to valid result matrix extents.
-        final int r0 = Math.max(0,      row - templateHeight);
+        final int r0 = Math.max(0,        row - templateHeight);
         final int r1 = Math.min(rows - 1, row + templateHeight);
-        final int c0 = Math.max(0,      col - templateWidth);
+        final int c0 = Math.max(0,        col - templateWidth);
         final int c1 = Math.min(cols - 1, col + templateWidth);
 
         for (int r = r0; r <= r1; r++) {
             final int rowOffset = r * cols;
             for (int c = c0; c <= c1; c++) {
-                // Skip self-comparison.
                 if (r == row && c == col) continue;
-
-                // Short-circuit: a single stronger neighbour disqualifies the candidate.
                 if (data[rowOffset + c] > center) return false;
             }
         }
@@ -491,11 +560,6 @@ public final class SubImageMatcher implements AutoCloseable {
      */
     public record MatchPoint(int x, int y, float confidence) {
 
-        /**
-         * Returns a human-readable summary for logging and debugging.
-         *
-         * @return e.g. {@code "MatchPoint{x=142, y=87, confidence=0.9741}"}
-         */
         @Override
         public String toString() {
             return String.format("MatchPoint{x=%d, y=%d, confidence=%.4f}", x, y, confidence);

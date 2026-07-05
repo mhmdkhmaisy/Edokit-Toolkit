@@ -73,13 +73,27 @@ public final class BuffReader {
      * Maximum per-channel value for a pixel to be classified as part of the
      * buff cell's outer 2px near-black bounding frame.
      *
-     * <p>70 is deliberately lenient: RuneScape's GDI-captured border pixels can
-     * read 50–65 across channels due to sub-pixel rendering and JPEG-like GDI
-     * compression artefacts.  The template match already confirmed the border
-     * pattern is present; this threshold guards only against stepping into a
-     * genuinely empty region of the HUD.
+     * <p>90 provides practical tolerance for GDI BitBlt capture variability:
+     * RuneScape's border pixels can read 65–88 across channels due to sub-pixel
+     * anti-aliasing and minor GDI colour-space rounding.  The template match
+     * already confirmed the border pattern is present; this threshold guards only
+     * against accidentally stepping into a genuinely empty HUD region.
+     *
+     * <p>Previous value was 70 — raised to 90 to avoid rejecting valid border
+     * pixels that land just above the old threshold due to GDI rounding.
      */
-    private static final int OUTER_BORDER_MAX_CHANNEL = 70;
+    private static final int OUTER_BORDER_MAX_CHANNEL = 90;
+
+    /**
+     * Minimum number of the 8 sampled border points that must read near-black
+     * for a slot to be considered valid.  6-of-8 provides a majority-vote
+     * tolerance so that a single bright anti-aliased corner pixel does not
+     * cause the whole slot to be rejected.
+     *
+     * <p>Previously the code required ALL 8 points to pass (all-or-nothing),
+     * which was too strict for real GDI-captured frames.
+     */
+    private static final int MIN_DARK_SAMPLES_REQUIRED = 6;
 
     /** Consecutive empty columns in a row before that row's horizontal scan stops. */
     private static final int MAX_EMPTY_COLS_BEFORE_ROW_STOP = 1;
@@ -183,20 +197,21 @@ public final class BuffReader {
      * sits at {@code (x, y)} carries a genuine buff-frame border.
      *
      * <h3>Sampling strategy</h3>
-     * Rather than checking every pixel across all 54 border positions (which fails
-     * on a single slightly-bright pixel), this method checks a strategic 8-point
-     * sample: the outer corner pixels at each quadrant of the top and left edges,
-     * plus the four extreme corners of the full cell border.  All sampled pixels
-     * must be dark (all channels ≤ {@link #OUTER_BORDER_MAX_CHANNEL}).
+     * Checks a strategic 8-point sample across the outer border of the cell:
+     * corners, mid-edge points, and the second-row/column positions.
+     * At least {@link #MIN_DARK_SAMPLES_REQUIRED} of the 8 samples must read
+     * near-black (all channels ≤ {@link #OUTER_BORDER_MAX_CHANNEL}).
      *
-     * <p>The template match that produced the anchor position already confirmed the
-     * full border pattern — this check is a lightweight guard against accidentally
-     * stepping into empty HUD space when scanning adjacent grid slots.
+     * <p>A majority-vote (6-of-8) is used instead of requiring all 8 to pass.
+     * This tolerates a single anti-aliased or GDI-rounded bright pixel without
+     * rejecting an otherwise valid buff slot.  The template match that produced
+     * the anchor already confirmed the full border pattern is present.
      *
      * @param screen the frame being scanned
      * @param x      candidate slot left edge
      * @param y      candidate slot top edge
-     * @return {@code true} if the sampled border pixels are sufficiently dark
+     * @return {@code true} if at least {@link #MIN_DARK_SAMPLES_REQUIRED} of the
+     *         8 sampled border pixels are sufficiently dark
      */
     private static boolean isValidBuffFrame(EdokitImage screen, int x, int y) {
         if (x < 0 || y < 0
@@ -205,19 +220,21 @@ public final class BuffReader {
             return false;
         }
 
-        final int e = BUFF_SIZE - 1; // last pixel index within the cell
+        final int e = BUFF_SIZE - 1; // last pixel index within the cell (= 26)
 
         // 8-point sample: top-left corner, top-right corner, bottom-left corner,
-        // mid-points on the top edge and left edge (both border rows/cols).
-        // Avoids scanning every pixel while still rejecting plain HUD background.
-        return isNearBlack(screen, x,         y        )  // top-left
-            && isNearBlack(screen, x + e,     y        )  // top-right
-            && isNearBlack(screen, x,         y + e    )  // bottom-left
-            && isNearBlack(screen, x + e / 2, y        )  // top mid
-            && isNearBlack(screen, x,         y + e / 2)  // left mid
-            && isNearBlack(screen, x + 1,     y        )  // top-left row-2
-            && isNearBlack(screen, x,         y + 1    )  // top-left col-2
-            && isNearBlack(screen, x + e / 2, y + 1    ); // top mid row-2
+        // mid-points on top and left edges, plus second-row/col positions.
+        int darkCount = 0;
+        if (isNearBlack(screen, x,         y        )) darkCount++; // top-left
+        if (isNearBlack(screen, x + e,     y        )) darkCount++; // top-right
+        if (isNearBlack(screen, x,         y + e    )) darkCount++; // bottom-left
+        if (isNearBlack(screen, x + e / 2, y        )) darkCount++; // top mid
+        if (isNearBlack(screen, x,         y + e / 2)) darkCount++; // left mid
+        if (isNearBlack(screen, x + 1,     y        )) darkCount++; // top-left row-2
+        if (isNearBlack(screen, x,         y + 1    )) darkCount++; // top-left col-2
+        if (isNearBlack(screen, x + e / 2, y + 1    )) darkCount++; // top mid row-2
+
+        return darkCount >= MIN_DARK_SAMPLES_REQUIRED;
     }
 
     /** Returns {@code true} if the pixel at {@code (x, y)} reads near-black. */
