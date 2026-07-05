@@ -112,29 +112,90 @@ public final class BuffReader {
     private final RasterOCR ocr = new RasterOCR();
 
     // =========================================================================
+    // Specification 0: Full-screen structural anchor scan
+    // =========================================================================
+
+    /**
+     * Slides a {@code BUFF_SIZE × BUFF_SIZE} window across the entire screen
+     * to locate the top-left corner of the first valid buff-slot border without
+     * requiring any pre-recorded template image.
+     *
+     * <h3>How this works (and why it replaces template matching)</h3>
+     * Alt1's {@code ImageDetect} is a direct per-pixel colour comparison, NOT
+     * OpenCV normalised cross-correlation.  The bundled {@code buffborder.data.png}
+     * is used by Alt1 as the colour reference for that comparison.  Using it as
+     * an OpenCV template fails for two reasons:
+     * <ol>
+     *   <li>The file shipped in this project is a placeholder green frame
+     *       {@code (90, 150, 25)} that does not match any on-screen pixel.</li>
+     *   <li>{@code TM_CCOEFF_NORMED} is a poor algorithm for a thin 1-px border
+     *       template; its mean-subtraction step makes nearly-uniform dark borders
+     *       produce near-zero variance → unreliable scores.</li>
+     * </ol>
+     *
+     * <p>The structural scan avoids both problems: it checks the exact pixel
+     * positions that RuneScape uses for the buff-slot border frame
+     * ({@link #isValidBuffFrame}) and requires no pre-recorded colour reference.
+     * Because RS3's UI is fully movable, the scan covers every (x, y) position
+     * in the frame — the buff bar will be found wherever the player placed it.
+     *
+     * <h3>Performance</h3>
+     * The inner loop uses a single-pixel fast-rejection path: if
+     * {@code max(R,G,B)} at {@code (x, y)} exceeds {@link #OUTER_BORDER_MAX_CHANNEL},
+     * the full 8-point border check is skipped immediately.  On a typical
+     * 1920 × 1080 frame the vast majority of pixels fail this first test, so the
+     * effective cost is roughly one array read + one branch per pixel — well under
+     * 50 ms per scan even on the JVM, acceptable for the 5-second rescan interval.
+     *
+     * <h3>Returned value</h3>
+     * The returned {@code int[2]} is {@code {anchorX, anchorY}} — the top-left
+     * corner of the first discovered valid slot.  Pass these directly to
+     * {@link #findBuffGrid} to map out the rest of the grid.  Returns
+     * {@link java.util.Optional#empty()} if no valid slot border is found anywhere
+     * on screen (i.e. no buffs are active or the HUD is hidden).
+     *
+     * @param screen the live frame to scan
+     * @return an Optional carrying {@code {x, y}} of the first valid buff slot,
+     *         or empty if none is found
+     */
+    public java.util.Optional<int[]> scanForBuffBar(EdokitImage screen) {
+        if (screen == null) return java.util.Optional.empty();
+
+        final int maxX = screen.width  - BUFF_SIZE;
+        final int maxY = screen.height - BUFF_SIZE;
+
+        for (int y = 0; y <= maxY; y++) {
+            for (int x = 0; x <= maxX; x++) {
+                // ── Fast rejection: the top-left corner pixel MUST be near-black.
+                // Most screen pixels fail here; the full 8-point check is expensive
+                // by comparison so we gate it behind this cheap single read.
+                if (!isNearBlack(screen, x, y)) continue;
+
+                // ── Full 8-point border validation ────────────────────────────
+                if (isValidBuffFrame(screen, x, y)) {
+                    return java.util.Optional.of(new int[]{x, y});
+                }
+            }
+        }
+
+        return java.util.Optional.empty();
+    }
+
+    // =========================================================================
     // Specification 1: Structural grid bounds & discovery
     // =========================================================================
 
     /**
      * Structurally scans the interface for occupied buff grid cells, starting
-     * from an anchor coordinate (typically resolved by
-     * {@link edokit.base.vision.SubImageMatcher} against the buff bar's header
-     * sprite) and stepping outward in {@link #GRID_SIZE} increments.
+     * from an anchor coordinate discovered by {@link #scanForBuffBar} and
+     * stepping outward in {@link #GRID_SIZE} increments.
      *
      * <h3>Detection heuristic</h3>
-     * A cell at {@code (x, y)} is considered an occupied buff slot when both of
-     * the following hold:
-     * <ol>
-     *   <li><b>Outer bounding frame</b> — the top-left 2px L-shaped border
-     *       (top edge + left edge) reads near-black
-     *       ({@code max(R,G,B) <= OUTER_BORDER_MAX_CHANNEL}).</li>
-     *   <li><b>Inner border gradient</b> — the pixel just inside that frame
-     *       reads a distinctive blue-grey tone ({@code R} and {@code G} within
-     *       a mid-grey band, {@code B} moderately higher than {@code R}/{@code G}).</li>
-     * </ol>
-     * Both checks must pass for the slot to be reported; an icon rendered with
-     * <em>no</em> frame (i.e. empty background) fails the outer check
-     * immediately and is skipped with no further per-pixel work.
+     * A cell at {@code (x, y)} is considered an occupied buff slot when the
+     * 8-point border sample passes the majority-vote check in
+     * {@link #isValidBuffFrame} — at least {@link #MIN_DARK_SAMPLES_REQUIRED}
+     * of the 8 sampled border positions read near-black
+     * ({@code max(R,G,B) <= OUTER_BORDER_MAX_CHANNEL}).
      *
      * <h3>Scan order &amp; early termination</h3>
      * Cells are scanned row-major (top to bottom, left to right within a row),
@@ -145,8 +206,8 @@ public final class BuffReader {
      * stops entirely the first time an entire row produces zero matches.
      *
      * @param screen  the live frame to scan
-     * @param anchorX left pixel coordinate of grid column 0
-     * @param anchorY top pixel coordinate of grid row 0
+     * @param anchorX left pixel coordinate of grid column 0 (from {@link #scanForBuffBar})
+     * @param anchorY top pixel coordinate of grid row 0 (from {@link #scanForBuffBar})
      * @param maxHor  maximum number of columns to probe
      * @param maxVer  maximum number of rows to probe
      * @return a list of {@link Rectangle} bounds (each {@code BUFF_SIZE x BUFF_SIZE})

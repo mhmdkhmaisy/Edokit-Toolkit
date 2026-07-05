@@ -3,7 +3,6 @@ package edokit.engine;
 import edokit.base.capture.NativeCaptureEngine;
 import edokit.base.io.EdokitImageLoader;
 import edokit.base.models.EdokitImage;
-import edokit.base.vision.SubImageMatcher;
 import edokit.buffs.BuffReader;
 import edokit.buffs.BuffReader.BuffDefinition;
 import edokit.buffs.BuffReader.TrackedBuff;
@@ -19,21 +18,33 @@ import java.util.Optional;
 /**
  * EdokitEngineRunner — Central orchestrator and entry point for the Edokit tracking pipeline.
  *
+ * <h2>Anchor discovery — structural scan (no template image required)</h2>
+ * The previous approach used OpenCV {@code TM_CCOEFF_NORMED} with the bundled
+ * {@code buffborder.data.png}.  That failed for two reasons:
+ * <ol>
+ *   <li>The bundled PNG is a placeholder green frame {@code (90,150,25)} — it
+ *       does not represent the actual RS3 buff-slot border and therefore matches
+ *       nothing on screen.</li>
+ *   <li>{@code TM_CCOEFF_NORMED} is poorly suited to thin 1-px border templates;
+ *       its mean-subtraction step produces near-zero variance for nearly-uniform
+ *       dark borders, making the confidence score unreliable regardless of which
+ *       template image is used.</li>
+ * </ol>
+ * The replacement is {@link BuffReader#scanForBuffBar(EdokitImage)}, which slides
+ * a {@code 27×27} window across every pixel of the captured frame and tests each
+ * position against the 8-point border heuristic.  Because the scan covers the full
+ * frame, the buff bar is found wherever the player has placed it — no fixed
+ * coordinates, no hardcoded offsets, fully compatible with RS3's movable UI.
+ *
  * <h2>Lifecycle</h2>
  * <ol>
  *   <li>Load font assets and build the buff definition database.</li>
  *   <li>Bind the GDI capture engine to the live RuneScape window.</li>
  *   <li>Register a JVM shutdown hook to guarantee safe GDI resource release.</li>
- *   <li>Enter the 30 FPS capture loop: anchor discovery every 150 frames,
- *       buff-bar reading on every frame once the grid is locked.</li>
+ *   <li>Enter the 30 FPS capture loop: full-screen structural anchor scan every
+ *       {@link #ANCHOR_RESCAN_INTERVAL} frames, buff-bar reading every frame once
+ *       the grid is locked.</li>
  * </ol>
- *
- * <h2>Anchor discovery strategy</h2>
- * Full OpenCV template matching on every frame is prohibitively expensive.
- * Instead, a {@link SubImageMatcher} runs every {@link #ANCHOR_RESCAN_INTERVAL}
- * frames (~5 seconds at 30 FPS). Between scans the last known
- * {@code List<Rectangle>} grid layout is reused, making the common hot path
- * a pure pixel-sampling operation with no native CV overhead.
  *
  * <h2>Thread safety</h2>
  * All capture and matching work executes on a single dedicated background thread.
@@ -52,35 +63,12 @@ public final class EdokitEngineRunner {
     /**
      * Classpath location of the Alt1 timer font JSON descriptor.
      * {@code pixel_8px_digits} is the dedicated digit-only font used by Alt1
-     * to render buff countdown overlays, making it the correct choice for
-     * buff-timer OCR.
+     * to render buff countdown overlays.
      */
     private static final String FONT_JSON_RESOURCE = "/fonts/pixel_8px_digits.fontmeta.json";
 
     /** Classpath location of the Alt1 timer font sprite sheet PNG. */
     private static final String FONT_IMG_RESOURCE = "/fonts/pixel_8px_digits.data.png";
-
-    /**
-     * Classpath location of the buff-bar anchor template PNG.
-     *
-     * <p>This is Alt1's official {@code buffborder.data.png} asset — the exact
-     * 27×27 pixel border frame that RuneScape renders around every active buff
-     * slot.  Using the real Alt1 sprite guarantees a pixel-accurate match against
-     * the live client without any colour-guessing heuristics.
-     */
-    private static final String ANCHOR_TEMPLATE_RESOURCE = "/buffs/buffborder.data.png";
-
-    /**
-     * Minimum {@code TM_CCOEFF_NORMED} confidence score for the buff-border
-     * template match to be accepted as a valid anchor.
-     *
-     * <p>0.85 sits in the practical range for game UI assets with the alpha-mask
-     * path active: transparent interior pixels are excluded from the correlation,
-     * so the score reflects only the border pixels that actually appear on screen.
-     * This eliminates the need to drop below 0.80 to compensate for the old
-     * transparent-interior poisoning problem.
-     */
-    private static final float ANCHOR_MATCH_THRESHOLD = 0.85f;
 
     /** Maximum horizontal slot columns to probe during {@link BuffReader#findBuffGrid}. */
     private static final int MAX_BUFF_COLS = 20;
@@ -89,7 +77,7 @@ public final class EdokitEngineRunner {
     private static final int MAX_BUFF_ROWS = 2;
 
     /**
-     * Frames between full OpenCV anchor re-scans (~5 seconds at 30 FPS).
+     * Frames between full structural anchor re-scans (~5 seconds at 30 FPS).
      * Keeping this high minimises idle CPU overhead while still adapting to
      * interface layout changes made by the user.
      */
@@ -97,9 +85,7 @@ public final class EdokitEngineRunner {
 
     /**
      * Maximum per-channel RGB delta for a buff fingerprint sample point to be
-     * considered a colour match. 30 provides a practical tolerance for minor
-     * in-game lighting variation without causing false positives between visually
-     * distinct icons.
+     * considered a colour match.
      */
     private static final int COLOR_TOLERANCE = 30;
 
@@ -116,26 +102,16 @@ public final class EdokitEngineRunner {
     /**
      * Application entry point.
      *
-     * <p>Performs the full initialization sequence, registers the JVM shutdown
-     * hook, and then blocks on the capture loop until the thread is interrupted
-     * or the JVM exits.
-     *
      * @param args command-line arguments (currently unused)
      * @throws IOException          if any required classpath resource cannot be loaded
      * @throws InterruptedException if the main thread is interrupted while waiting
      */
     public static void main(String[] args) throws IOException, InterruptedException {
 
-        // ── Step 1a: Load timer font ──────────────────────────────────────────
+        // ── Step 1: Load timer font ───────────────────────────────────────────
         System.out.println("[Edokit Engine] Loading timer font...");
         final FontSheet timerFont = loadFontSheet();
         System.out.println("[Edokit Engine] Font loaded: " + timerFont);
-
-        // ── Step 1b: Load anchor template for grid discovery ──────────────────
-        System.out.println("[Edokit Engine] Loading buff anchor template...");
-        final EdokitImage anchorTemplate = loadAnchorTemplate();
-        System.out.println("[Edokit Engine] Anchor template loaded: "
-                + anchorTemplate.width + "×" + anchorTemplate.height + " px.");
 
         // ── Step 2: Build buff definition database ────────────────────────────
         final List<BuffDefinition> buffDatabase = buildBuffDatabase();
@@ -151,8 +127,6 @@ public final class EdokitEngineRunner {
                 + captureEngine.getCaptureHeight() + " px).");
 
         // ── Step 4: Register JVM shutdown hook ────────────────────────────────
-        // Ensures GDI device contexts, bitmaps, and memory DCs are always released
-        // — even on SIGTERM, SIGKILL, or an uncaught exception on another thread.
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("[Edokit Engine] Shutdown hook triggered — releasing GDI resources.");
             captureEngine.close();
@@ -161,12 +135,11 @@ public final class EdokitEngineRunner {
 
         // ── Step 5: Run the capture loop on a dedicated thread ────────────────
         final Thread captureThread = new Thread(
-                () -> runCaptureLoop(captureEngine, anchorTemplate, timerFont, buffDatabase),
+                () -> runCaptureLoop(captureEngine, timerFont, buffDatabase),
                 "edokit-capture");
-        captureThread.setDaemon(false); // keep JVM alive until this thread exits
+        captureThread.setDaemon(false);
         captureThread.start();
 
-        // Park the main thread until the capture thread finishes (e.g. interrupted).
         captureThread.join();
         System.out.println("[Edokit Engine] Capture thread exited. Main thread returning.");
     }
@@ -178,139 +151,133 @@ public final class EdokitEngineRunner {
     /**
      * The primary 30 FPS background tracking loop.
      *
-     * <p>Runs until {@link Thread#isInterrupted()} returns {@code true} or the
-     * thread is interrupted during a {@link Thread#sleep} call.
-     *
      * <h3>Loop structure per frame</h3>
      * <ol>
      *   <li>Capture the live GDI frame; retry on window error.</li>
-     *   <li>Every {@link #ANCHOR_RESCAN_INTERVAL} frames: run OpenCV template
-     *       matching to (re-)discover the buff grid anchor and populate
-     *       {@code activeSlots} via {@link BuffReader#findBuffGrid}.</li>
+     *   <li>Every {@link #ANCHOR_RESCAN_INTERVAL} frames: run a full-screen
+     *       structural scan via {@link BuffReader#scanForBuffBar} to (re-)discover
+     *       the buff grid anchor.  This replaces OpenCV template matching entirely —
+     *       the scan is position-independent and works with RS3's movable UI.</li>
      *   <li>If grid slots are known: invoke {@link BuffReader#readBuffBar} and
-     *       print any identified buffs to stdout.</li>
+     *       print identified buffs to stdout.</li>
      *   <li>Sleep {@link #FRAME_SLEEP_MS} ms to pace the loop to ~30 FPS.</li>
      * </ol>
      *
-     * @param captureEngine  the bound GDI capture engine
-     * @param anchorTemplate the template image used for grid-origin detection
-     * @param timerFont      the OCR font for countdown-timer overlay reading
-     * @param buffDatabase   known buff colour fingerprints, tried in order
+     * @param captureEngine the bound GDI capture engine
+     * @param timerFont     the OCR font for countdown-timer overlay reading
+     * @param buffDatabase  known buff colour fingerprints, tried in order
      */
     private static void runCaptureLoop(NativeCaptureEngine captureEngine,
-                                       EdokitImage anchorTemplate,
                                        FontSheet timerFont,
                                        List<BuffDefinition> buffDatabase) {
 
         final BuffReader buffReader = new BuffReader();
 
-        // Anchor discovery state — reset when a rescan is triggered.
         boolean gridDiscovered = false;
         List<Rectangle> activeSlots = null;
         int frameCount = 0;
 
-        // Pre-allocate the SubImageMatcher once; its native Mats are reused per-frame.
-        try (SubImageMatcher anchorMatcher = new SubImageMatcher(anchorTemplate)) {
+        System.out.println("[Edokit Engine] Entering capture loop. Press Ctrl+C to exit.");
+        System.out.println("[Edokit Engine] Anchor strategy: full-screen structural scan "
+                + "(position-independent, works with movable RS3 UI).");
 
-            System.out.println("[Edokit Engine] Entering capture loop. Press Ctrl+C to exit.");
+        while (!Thread.currentThread().isInterrupted()) {
 
-            while (!Thread.currentThread().isInterrupted()) {
-
-                // ── 1. Grab live frame ────────────────────────────────────────
-                final EdokitImage frame;
+            // ── 1. Grab live frame ────────────────────────────────────────────
+            final EdokitImage frame;
+            try {
+                frame = captureEngine.capture();
+            } catch (IllegalStateException captureError) {
+                System.err.println("[Edokit Engine] Capture failed (window unavailable): "
+                        + captureError.getMessage()
+                        + " — retrying in " + WINDOW_RETRY_SLEEP_MS + " ms.");
+                gridDiscovered = false;
+                activeSlots    = null;
                 try {
-                    frame = captureEngine.capture();
-                } catch (IllegalStateException captureError) {
-                    // Window minimised, occluded, or closed — back off and retry.
-                    System.err.println("[Edokit Engine] Capture failed (window unavailable): "
-                            + captureError.getMessage()
-                            + " — retrying in " + WINDOW_RETRY_SLEEP_MS + " ms.");
-                    gridDiscovered = false; // anchor coordinates may have shifted on re-show
-                    activeSlots    = null;
-                    try {
-                        Thread.sleep(WINDOW_RETRY_SLEEP_MS);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                    }
-                    continue;
+                    Thread.sleep(WINDOW_RETRY_SLEEP_MS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
                 }
+                continue;
+            }
 
-                // ── 2. Anchor detection (first run or periodic rescan) ─────────
-                // Run a full OpenCV template match only when the grid is undiscovered
-                // or the rescan interval has elapsed. Between scans the cached
-                // activeSlots list is reused, keeping the hot path allocation-free.
-                final boolean rescanDue = !gridDiscovered
-                        || (frameCount % ANCHOR_RESCAN_INTERVAL == 0 && frameCount > 0);
+            // ── 2. Anchor detection (first run or periodic rescan) ─────────────
+            // Structural scan: slides across every pixel of the frame looking for
+            // the RS3 buff-slot border pattern.  Runs on the first frame and then
+            // every ANCHOR_RESCAN_INTERVAL frames (~5 s at 30 FPS).
+            final boolean rescanDue = !gridDiscovered
+                    || (frameCount % ANCHOR_RESCAN_INTERVAL == 0 && frameCount > 0);
 
-                if (rescanDue) {
-                    final Optional<SubImageMatcher.MatchPoint> anchorHit =
-                            anchorMatcher.findBest(frame, ANCHOR_MATCH_THRESHOLD);
+            if (rescanDue) {
+                final long scanStart = System.currentTimeMillis();
+                final Optional<int[]> anchor = buffReader.scanForBuffBar(frame);
+                final long scanMs = System.currentTimeMillis() - scanStart;
 
-                    if (anchorHit.isPresent()) {
-                        final SubImageMatcher.MatchPoint hit = anchorHit.get();
+                if (anchor.isPresent()) {
+                    final int anchorX = anchor.get()[0];
+                    final int anchorY = anchor.get()[1];
 
+                    System.out.printf(
+                            "[Edokit Debug] Structural scan found buff border at (X:%d, Y:%d) in %d ms%n",
+                            anchorX, anchorY, scanMs);
+
+                    final List<Rectangle> discovered =
+                            buffReader.findBuffGrid(frame, anchorX, anchorY,
+                                    MAX_BUFF_COLS, MAX_BUFF_ROWS);
+
+                    if (!discovered.isEmpty()) {
+                        activeSlots    = discovered;
+                        gridDiscovered = true;
                         System.out.printf(
-                                "[Edokit Debug] Best match confidence found on screen: %.4f at (X: %d, Y: %d)%n",
-                                hit.confidence(), hit.x(), hit.y());
-
-                        final List<Rectangle> discovered =
-                                buffReader.findBuffGrid(frame, hit.x(), hit.y(),
-                                        MAX_BUFF_COLS, MAX_BUFF_ROWS);
-
-                        if (!discovered.isEmpty()) {
-                            activeSlots    = discovered;
-                            gridDiscovered = true;
-                            System.out.printf("[Edokit Engine] Buff grid discovered at (%d, %d) — "
-                                    + "%d active slot(s) cached. (confidence=%.4f)%n",
-                                    hit.x(), hit.y(), activeSlots.size(), hit.confidence());
-                        } else {
-                            System.err.printf(
-                                    "[Edokit Debug] Anchor matched with %.4f confidence, but "
-                                    + "findBuffGrid failed to discover valid occupied slots "
-                                    + "at this coordinate location.%n",
-                                    hit.confidence());
-                            activeSlots    = null;
-                            gridDiscovered = false;
-                        }
+                                "[Edokit Engine] Buff grid discovered at (%d, %d) — "
+                                + "%d active slot(s) cached.%n",
+                                anchorX, anchorY, activeSlots.size());
                     } else {
-                        System.out.printf(
-                                "[Edokit Debug] Best match confidence found on screen: <none above %.2f> at (X: N/A, Y: N/A)%n",
-                                ANCHOR_MATCH_THRESHOLD);
-                        if (gridDiscovered) {
-                            System.err.println("[Edokit Engine] Anchor lost — "
-                                    + "will retry on next rescan interval.");
-                        }
+                        // scanForBuffBar found a frame but findBuffGrid mapped zero slots —
+                        // this can happen if the single frame the scanner hit is a non-buff
+                        // dark border element.  Continue scanning on the next interval.
+                        System.err.printf(
+                                "[Edokit Debug] Border found at (%d,%d) but findBuffGrid "
+                                + "returned 0 occupied slots — will retry on next rescan.%n",
+                                anchorX, anchorY);
                         activeSlots    = null;
                         gridDiscovered = false;
                     }
-                }
-
-                // ── 3. Fast-path buff reading (every frame, grid must be known) ──
-                // Pass null for the database: report every discovered slot by position
-                // rather than requiring colour-fingerprint definitions.
-                if (gridDiscovered && activeSlots != null && !activeSlots.isEmpty()) {
-                    final List<TrackedBuff> activeBuff =
-                            buffReader.readBuffBar(frame, activeSlots,
-                                    timerFont, null, COLOR_TOLERANCE);
-
-                    System.out.printf("[Edokit Engine] Active buffs detected: %d%n", activeBuff.size());
-                    for (final TrackedBuff buff : activeBuff) {
-                        final String timer = buff.timerText().isEmpty() ? "N/A" : buff.timerText();
-                        System.out.printf("[Edokit Engine]   %s | Timer: %s%n",
-                                buff.buffName(), timer);
+                } else {
+                    System.out.printf(
+                            "[Edokit Debug] Structural scan: no buff border found on screen "
+                            + "(%dx%d frame, scan took %d ms). No active buffs or HUD hidden.%n",
+                            frame.width, frame.height, scanMs);
+                    if (gridDiscovered) {
+                        System.err.println("[Edokit Engine] Anchor lost — retrying on next interval.");
                     }
-                }
-
-                // ── 4. Frame pacing — ~30 FPS ─────────────────────────────────
-                frameCount++;
-                try {
-                    Thread.sleep(FRAME_SLEEP_MS);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt(); // restore flag and exit loop
+                    activeSlots    = null;
+                    gridDiscovered = false;
                 }
             }
 
-        } // SubImageMatcher.close() releases OpenCV native Mats here
+            // ── 3. Fast-path buff reading (every frame, grid must be known) ──
+            if (gridDiscovered && activeSlots != null && !activeSlots.isEmpty()) {
+                final List<TrackedBuff> activeBuff =
+                        buffReader.readBuffBar(frame, activeSlots,
+                                timerFont, buffDatabase, COLOR_TOLERANCE);
+
+                System.out.printf("[Edokit Engine] Active buffs detected: %d%n", activeBuff.size());
+                for (final TrackedBuff buff : activeBuff) {
+                    final String timer = buff.timerText().isEmpty() ? "N/A" : buff.timerText();
+                    System.out.printf("[Edokit Engine]   %s | Timer: %s%n",
+                            buff.buffName(), timer);
+                }
+            }
+
+            // ── 4. Frame pacing — ~30 FPS ─────────────────────────────────────
+            frameCount++;
+            try {
+                Thread.sleep(FRAME_SLEEP_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
 
         System.out.println("[Edokit Engine] Capture loop terminated after "
                 + frameCount + " frame(s).");
@@ -323,11 +290,6 @@ public final class EdokitEngineRunner {
     /**
      * Loads the Alt1 timer font from the {@code /fonts/} classpath directory.
      *
-     * <p>Both the {@code .fontmeta.json} descriptor and the companion
-     * {@code .data.png} sprite sheet are opened as classpath resources.
-     * Neither stream is closed before {@link FontSheet#load} returns — the
-     * method fully reads both before returning the immutable {@code FontSheet}.
-     *
      * @return the fully parsed font sheet
      * @throws IOException if either resource is missing or the JSON is malformed
      */
@@ -335,16 +297,14 @@ public final class EdokitEngineRunner {
         final InputStream jsonStream = EdokitEngineRunner.class.getResourceAsStream(FONT_JSON_RESOURCE);
         if (jsonStream == null) {
             throw new IOException(
-                    "Font JSON resource not found on classpath: " + FONT_JSON_RESOURCE
-                    + " — ensure the file exists under src/main/resources/fonts/.");
+                    "Font JSON resource not found on classpath: " + FONT_JSON_RESOURCE);
         }
 
         final InputStream imgStream = EdokitEngineRunner.class.getResourceAsStream(FONT_IMG_RESOURCE);
         if (imgStream == null) {
             jsonStream.close();
             throw new IOException(
-                    "Font image resource not found on classpath: " + FONT_IMG_RESOURCE
-                    + " — ensure the file exists under src/main/resources/fonts/.");
+                    "Font image resource not found on classpath: " + FONT_IMG_RESOURCE);
         }
 
         try (jsonStream; imgStream) {
@@ -353,24 +313,19 @@ public final class EdokitEngineRunner {
     }
 
     /**
-     * Loads Alt1's official {@code buffborder.data.png} from the {@code /buffs/}
-     * classpath directory and returns it as an {@link EdokitImage}.
+     * Loads an {@link EdokitImage} from a classpath resource path.
+     * Kept as a utility for any callers that still need to load PNG assets
+     * (e.g., future Alt1-style direct-colour matchers).
      *
-     * <p>This sprite is the exact 27×27 pixel border frame that RuneScape renders
-     * around every active buff slot.  {@link SubImageMatcher} uses it as the
-     * template target to locate the buff grid's top-left origin on every anchor
-     * scan pass — no colour-guessing heuristics are needed because the match is
-     * pixel-accurate against the real client asset.
-     *
-     * @return the buffborder template as an {@link EdokitImage} in raw RGBA format
+     * @param resourcePath classpath-absolute resource path (e.g. {@code "/buffs/buffborder.data.png"})
+     * @return loaded image
      * @throws IOException if the resource is missing or the format is unsupported
      */
-    private static EdokitImage loadAnchorTemplate() throws IOException {
-        final InputStream stream = EdokitEngineRunner.class.getResourceAsStream(ANCHOR_TEMPLATE_RESOURCE);
+    @SuppressWarnings("unused")
+    static EdokitImage loadResource(String resourcePath) throws IOException {
+        final InputStream stream = EdokitEngineRunner.class.getResourceAsStream(resourcePath);
         if (stream == null) {
-            throw new IOException(
-                    "Buff-border anchor resource not found on classpath: " + ANCHOR_TEMPLATE_RESOURCE
-                    + " — ensure buffborder.data.png exists under src/main/resources/buffs/.");
+            throw new IOException("Resource not found on classpath: " + resourcePath);
         }
         try (stream) {
             return EdokitImageLoader.load(stream);
@@ -378,7 +333,7 @@ public final class EdokitEngineRunner {
     }
 
     /**
-     * Constructs the buff definition database for testing purposes.
+     * Constructs the buff definition database.
      *
      * <p>Each {@link BuffDefinition} encodes 3–5 pixel sample offsets within
      * the {@code 27×27} buff icon square and the expected colour at each offset,
@@ -396,44 +351,18 @@ public final class EdokitEngineRunner {
     private static List<BuffDefinition> buildBuffDatabase() {
         final List<BuffDefinition> database = new ArrayList<>();
 
-        /*
-         * Overload — the signature orange-red combat potion buff.
-         *
-         * Sample points are drawn from the central orb area of the icon, which
-         * renders a distinctive gradient from dark crimson at the core to bright
-         * orange at the highlight edge.  All three offsets are in the upper-centre
-         * of the 27×27 cell, safely above the countdown timer zone at the bottom.
-         *
-         *   (13, 7)  → dark crimson core          0xB03010
-         *   (18, 11) → bright orange highlight     0xE06020
-         *   (10, 15) → mid-tone red-orange slope   0xC04818
-         *   (13, 20) → deep shadow at lower orb    0x6C1808
-         */
         database.add(new BuffDefinition(
                 "Overload",
-                new int[]{ 13, 18, 10, 13 },           // sampleOffsetsX
-                new int[]{  7, 11, 15, 20 },           // sampleOffsetsY
-                new int[]{ 0xB03010, 0xE06020, 0xC04818, 0x6C1808 } // expectedRGBs (0xRRGGBB)
+                new int[]{ 13, 18, 10, 13 },
+                new int[]{  7, 11, 15, 20 },
+                new int[]{ 0xB03010, 0xE06020, 0xC04818, 0x6C1808 }
         ));
 
-        /*
-         * Prayer Renewal — the pale-blue prayer-sustain buff.
-         *
-         * The icon features a bright teardrop silhouette with a cool blue-white
-         * body and a darker teal shadow at the base.  Sample points avoid the
-         * white rim (susceptible to anti-aliasing variation) and the transparent
-         * icon border.
-         *
-         *   (13, 6)  → bright blue-white centre    0x5090D8
-         *   (18, 10) → lighter blue highlight edge 0x70B0E8
-         *   ( 9, 16) → mid teal body               0x3870B8
-         *   (13, 22) → deep teal base shadow       0x184878
-         */
         database.add(new BuffDefinition(
                 "Prayer Renewal",
-                new int[]{ 13, 18,  9, 13 },           // sampleOffsetsX
-                new int[]{  6, 10, 16, 22 },           // sampleOffsetsY
-                new int[]{ 0x5090D8, 0x70B0E8, 0x3870B8, 0x184878 } // expectedRGBs (0xRRGGBB)
+                new int[]{ 13, 18,  9, 13 },
+                new int[]{  6, 10, 16, 22 },
+                new int[]{ 0x5090D8, 0x70B0E8, 0x3870B8, 0x184878 }
         ));
 
         return database;
