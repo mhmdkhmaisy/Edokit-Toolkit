@@ -70,30 +70,42 @@ public final class BuffReader {
     // -------------------------------------------------------------------------
 
     /**
-     * Maximum per-channel value for a pixel to be classified as part of the
-     * buff cell's outer 2px near-black bounding frame.
+     * Expected red channel value of the RS3 buff-slot outer border.
      *
-     * <p>90 provides practical tolerance for GDI BitBlt capture variability:
-     * RuneScape's border pixels can read 65–88 across channels due to sub-pixel
-     * anti-aliasing and minor GDI colour-space rounding.  The template match
-     * already confirmed the border pattern is present; this threshold guards only
-     * against accidentally stepping into a genuinely empty HUD region.
-     *
-     * <p>Previous value was 70 — raised to 90 to avoid rejecting valid border
-     * pixels that land just above the old threshold due to GDI rounding.
+     * <p>RuneScape's buff-slot frame colour is {@code (90, 150, 25)} — an olive
+     * green — as confirmed by inspecting the Alt1 {@code buffborder.data.png}
+     * asset pixel-by-pixel.  GDI BitBlt capture can shift individual channels
+     * by up to ±15 due to colour-space rounding; {@link #BORDER_TOLERANCE}
+     * absorbs that variation.
      */
-    private static final int OUTER_BORDER_MAX_CHANNEL = 90;
+    private static final int BORDER_R = 90;
+
+    /** Expected green channel value of the RS3 buff-slot outer border. */
+    private static final int BORDER_G = 150;
+
+    /** Expected blue channel value of the RS3 buff-slot outer border. */
+    private static final int BORDER_B = 25;
 
     /**
-     * Minimum number of the 8 sampled border points that must read near-black
-     * for a slot to be considered valid.  6-of-8 provides a majority-vote
-     * tolerance so that a single bright anti-aliased corner pixel does not
-     * cause the whole slot to be rejected.
+     * Per-channel absolute-difference tolerance for the buff border colour
+     * check ({@link #isBuffBorderColor}).
      *
-     * <p>Previously the code required ALL 8 points to pass (all-or-nothing),
-     * which was too strict for real GDI-captured frames.
+     * <p>40 is deliberately generous: GDI BitBlt and JPEG compression in
+     * screenshots can shift channels by ±15, anti-aliasing at the edge can
+     * blend the border colour with the background, and the user's game
+     * brightness/gamma may shift all channels uniformly.  A tolerance of 40
+     * keeps the check specific to the olive-green border range while tolerating
+     * all of the above in practice.
      */
-    private static final int MIN_DARK_SAMPLES_REQUIRED = 6;
+    private static final int BORDER_TOLERANCE = 40;
+
+    /**
+     * Minimum number of the 8 sampled border points that must match the
+     * expected buff border colour for a slot to be considered valid.
+     * 6-of-8 provides a majority-vote tolerance so that a single anti-aliased
+     * or mis-captured corner pixel does not cause the whole slot to be rejected.
+     */
+    private static final int MIN_BORDER_SAMPLES_REQUIRED = 6;
 
     /** Consecutive empty columns in a row before that row's horizontal scan stops. */
     private static final int MAX_EMPTY_COLS_BEFORE_ROW_STOP = 1;
@@ -166,10 +178,11 @@ public final class BuffReader {
 
         for (int y = 0; y <= maxY; y++) {
             for (int x = 0; x <= maxX; x++) {
-                // ── Fast rejection: the top-left corner pixel MUST be near-black.
-                // Most screen pixels fail here; the full 8-point check is expensive
-                // by comparison so we gate it behind this cheap single read.
-                if (!isNearBlack(screen, x, y)) continue;
+                // ── Fast rejection: top-left pixel must match the buff border colour.
+                // The RS3 buff slot border is (90, 150, 25) — an olive green.
+                // Most screen pixels are not that shade, so this single comparison
+                // eliminates the vast majority of positions cheaply.
+                if (!isBuffBorderColor(screen, x, y)) continue;
 
                 // ── Full 8-point border validation ────────────────────────────
                 if (isValidBuffFrame(screen, x, y)) {
@@ -258,21 +271,21 @@ public final class BuffReader {
      * sits at {@code (x, y)} carries a genuine buff-frame border.
      *
      * <h3>Sampling strategy</h3>
-     * Checks a strategic 8-point sample across the outer border of the cell:
-     * corners, mid-edge points, and the second-row/column positions.
-     * At least {@link #MIN_DARK_SAMPLES_REQUIRED} of the 8 samples must read
-     * near-black (all channels ≤ {@link #OUTER_BORDER_MAX_CHANNEL}).
+     * Checks 8 strategic positions across the outer border of the cell: corners,
+     * mid-edge points, and second-row/column positions.  At least
+     * {@link #MIN_BORDER_SAMPLES_REQUIRED} of the 8 samples must match the RS3
+     * buff-slot border colour {@code (BORDER_R, BORDER_G, BORDER_B)} within
+     * {@link #BORDER_TOLERANCE} per channel.
      *
      * <p>A majority-vote (6-of-8) is used instead of requiring all 8 to pass.
-     * This tolerates a single anti-aliased or GDI-rounded bright pixel without
-     * rejecting an otherwise valid buff slot.  The template match that produced
-     * the anchor already confirmed the full border pattern is present.
+     * This tolerates a single anti-aliased or GDI-rounded pixel without
+     * rejecting an otherwise valid buff slot.
      *
      * @param screen the frame being scanned
      * @param x      candidate slot left edge
      * @param y      candidate slot top edge
-     * @return {@code true} if at least {@link #MIN_DARK_SAMPLES_REQUIRED} of the
-     *         8 sampled border pixels are sufficiently dark
+     * @return {@code true} if at least {@link #MIN_BORDER_SAMPLES_REQUIRED} of the
+     *         8 sampled border pixels match the RS3 buff border colour
      */
     private static boolean isValidBuffFrame(EdokitImage screen, int x, int y) {
         if (x < 0 || y < 0
@@ -285,27 +298,37 @@ public final class BuffReader {
 
         // 8-point sample: top-left corner, top-right corner, bottom-left corner,
         // mid-points on top and left edges, plus second-row/col positions.
-        int darkCount = 0;
-        if (isNearBlack(screen, x,         y        )) darkCount++; // top-left
-        if (isNearBlack(screen, x + e,     y        )) darkCount++; // top-right
-        if (isNearBlack(screen, x,         y + e    )) darkCount++; // bottom-left
-        if (isNearBlack(screen, x + e / 2, y        )) darkCount++; // top mid
-        if (isNearBlack(screen, x,         y + e / 2)) darkCount++; // left mid
-        if (isNearBlack(screen, x + 1,     y        )) darkCount++; // top-left row-2
-        if (isNearBlack(screen, x,         y + 1    )) darkCount++; // top-left col-2
-        if (isNearBlack(screen, x + e / 2, y + 1    )) darkCount++; // top mid row-2
+        int borderCount = 0;
+        if (isBuffBorderColor(screen, x,         y        )) borderCount++; // top-left
+        if (isBuffBorderColor(screen, x + e,     y        )) borderCount++; // top-right
+        if (isBuffBorderColor(screen, x,         y + e    )) borderCount++; // bottom-left
+        if (isBuffBorderColor(screen, x + e / 2, y        )) borderCount++; // top mid
+        if (isBuffBorderColor(screen, x,         y + e / 2)) borderCount++; // left mid
+        if (isBuffBorderColor(screen, x + 1,     y        )) borderCount++; // top-left row-2
+        if (isBuffBorderColor(screen, x,         y + 1    )) borderCount++; // top-left col-2
+        if (isBuffBorderColor(screen, x + e / 2, y + 1    )) borderCount++; // top mid row-2
 
-        return darkCount >= MIN_DARK_SAMPLES_REQUIRED;
+        return borderCount >= MIN_BORDER_SAMPLES_REQUIRED;
     }
 
-    /** Returns {@code true} if the pixel at {@code (x, y)} reads near-black. */
-    private static boolean isNearBlack(EdokitImage screen, int x, int y) {
+    /**
+     * Returns {@code true} if the pixel at {@code (x, y)} matches the RS3
+     * buff-slot outer border colour {@code (BORDER_R, BORDER_G, BORDER_B)}
+     * within {@link #BORDER_TOLERANCE} per channel.
+     *
+     * <p>The RS3 buff border is an olive green {@code (90, 150, 25)}.  GDI
+     * BitBlt capture may shift channels by ±15; a tolerance of 40 handles this
+     * plus minor anti-aliasing blending at the edge.
+     */
+    private static boolean isBuffBorderColor(EdokitImage screen, int x, int y) {
         final int off = screen.pixelOffset(x, y);
         final byte[] data = screen.data;
         final int r = data[off]     & 0xFF;
         final int g = data[off + 1] & 0xFF;
         final int b = data[off + 2] & 0xFF;
-        return Math.max(r, Math.max(g, b)) <= OUTER_BORDER_MAX_CHANNEL;
+        return Math.abs(r - BORDER_R) <= BORDER_TOLERANCE
+            && Math.abs(g - BORDER_G) <= BORDER_TOLERANCE
+            && Math.abs(b - BORDER_B) <= BORDER_TOLERANCE;
     }
 
     // =========================================================================
