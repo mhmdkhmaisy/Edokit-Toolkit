@@ -373,8 +373,8 @@ public final class BuffReader {
      * @param database       known buff colour fingerprints, tried in order
      * @param colorTolerance maximum per-channel RGB delta for a fingerprint
      *                       offset to be considered a match
-     * @return one {@link TrackedBuff} per slot that both matched a known
-     *         fingerprint; slots with no fingerprint match are omitted
+     * @return one {@link TrackedBuff} per occupied slot; slots with no matching
+     *         fingerprint are included with name {@code "Unknown (Slot N)"}
      */
     public List<TrackedBuff> readBuffBar(EdokitImage screenFrame,
                                          List<Rectangle> activeSlots,
@@ -403,21 +403,24 @@ public final class BuffReader {
                 }
             }
 
-            // ── Step C: colour-fingerprint match, or count-only mode ─────────────
-            // When database is null or empty every discovered slot is reported by
-            // its grid position — useful for counting active buffs without needing
-            // pre-defined fingerprints.
-            if (database != null && !database.isEmpty()) {
+            // ── Step C: colour-fingerprint match against the known buff database ──
+            // Slots that match a definition are reported with their canonical name.
+            // Slots that match nothing are still reported as "Unknown" — callers
+            // receive the full occupied-slot count regardless of identification.
+            String matchedName = null;
+            if (database != null) {
                 for (int d = 0; d < database.size(); d++) {
                     final BuffDefinition def = database.get(d);
                     if (countMatch(screenFrame, slot, def, colorTolerance)) {
-                        tracked.add(new TrackedBuff(i, def.name(), timerText));
+                        matchedName = def.name();
                         break; // first matching definition wins this slot
                     }
                 }
-            } else {
-                tracked.add(new TrackedBuff(i, "Slot " + (i + 1), timerText));
             }
+            tracked.add(new TrackedBuff(
+                    i,
+                    matchedName != null ? matchedName : "Unknown (Slot " + (i + 1) + ")",
+                    timerText));
         }
 
         return tracked;
