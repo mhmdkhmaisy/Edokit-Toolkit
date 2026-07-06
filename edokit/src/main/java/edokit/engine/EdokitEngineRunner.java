@@ -10,11 +10,14 @@ import edokit.buffs.BuffReader.TrackedBuff;
 import edokit.ocr.FontSheet;
 
 import java.awt.Rectangle;
+import java.awt.image.BufferedImage;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import javax.imageio.ImageIO;
 
 /**
  * EdokitEngineRunner — Central orchestrator and entry point for the Edokit tracking pipeline.
@@ -221,6 +224,7 @@ public final class EdokitEngineRunner {
         boolean gridDiscovered = false;
         List<Rectangle> activeSlots = null;
         int frameCount = 0;
+        boolean debugFrameDumped = false;   // dump captured frame once on first buff-bar lock
 
         System.out.println("[Edokit Engine] Entering capture loop. Press Ctrl+C to exit.");
         System.out.println("[Edokit Engine] Primary anchor: Alt1-style colour scan (buffborder.data.png).");
@@ -267,6 +271,17 @@ public final class EdokitEngineRunner {
                         System.out.printf(
                                 "[Edokit Engine] Buff grid at (%d, %d) — %d active slot(s).%n",
                                 anchorX, anchorY, activeSlots.size());
+
+                        // ── One-time debug dump ───────────────────────────────
+                        // Saves the composite captured frame to edokit_debug_frame.png
+                        // so you can verify the frame includes Alt1 overlay text.
+                        // Compare it to an in-game screenshot: if the timer text
+                        // (e.g. "6hr", "13m") is missing from the dump, the capture
+                        // is not reaching the Alt1 overlay window.
+                        if (!debugFrameDumped) {
+                            debugFrameDumped = true;
+                            dumpFrameToPng(frame, "edokit_debug_frame.png");
+                        }
                     } else {
                         // Anchor found but grid has no occupied slots.
                         // Could be a false positive; clear and retry next interval.
@@ -442,5 +457,43 @@ public final class EdokitEngineRunner {
         ));
 
         return database;
+    }
+
+    // =========================================================================
+    // Debug utilities
+    // =========================================================================
+
+    /**
+     * Saves {@code frame} as a PNG file at {@code path} (relative to the
+     * working directory).  Called once on first buff-bar lock so you can open
+     * the file and verify the composite GDI capture includes Alt1 overlay text.
+     *
+     * <p>If the timer text you see on screen (e.g. "6hr", "13m") is <em>absent</em>
+     * from the saved PNG, the desktop-DC composite capture is not yet reaching the
+     * Alt1 overlay window.  If the text <em>is</em> present but OCR still returns
+     * N/A, the font colour (white) does not match the rendered colour.
+     */
+    private static void dumpFrameToPng(EdokitImage frame, String path) {
+        try {
+            final BufferedImage img = new BufferedImage(
+                    frame.width, frame.height, BufferedImage.TYPE_INT_ARGB);
+            final byte[] d = frame.data;
+            for (int y = 0; y < frame.height; y++) {
+                for (int x = 0; x < frame.width; x++) {
+                    final int off = (x + y * frame.width) * 4;
+                    final int r   = d[off]     & 0xFF;
+                    final int g   = d[off + 1] & 0xFF;
+                    final int b   = d[off + 2] & 0xFF;
+                    img.setRGB(x, y, (0xFF << 24) | (r << 16) | (g << 8) | b);
+                }
+            }
+            ImageIO.write(img, "PNG", new File(path));
+            System.out.println("[Edokit Debug] Captured frame saved → " + new File(path).getAbsolutePath());
+            System.out.println("[Edokit Debug] Open it and check: does it show Alt1 timer text?");
+            System.out.println("[Edokit Debug]   YES → OCR font/Y needs tuning (open an issue).");
+            System.out.println("[Edokit Debug]   NO  → Alt1 overlay window not captured; check if Alt1 is running.");
+        } catch (Exception e) {
+            System.err.println("[Edokit Debug] Frame dump failed: " + e.getMessage());
+        }
     }
 }

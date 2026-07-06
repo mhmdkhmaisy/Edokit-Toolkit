@@ -100,10 +100,20 @@ public final class NativeCaptureEngine implements AutoCloseable {
      * Constructs a capture engine bound to the first top-level window whose
      * title exactly matches {@code windowTitle}.
      *
+     * <h3>Composite capture</h3>
+     * To include overlay windows rendered on top of the game (e.g. Alt1 Toolkit's
+     * transparent timer overlays), this engine uses the <em>desktop device context</em>
+     * ({@code GetDC(null)}) rather than the game window's own DC.  Each frame is
+     * captured via {@code BitBlt} from the desktop DC at the game window's current
+     * screen coordinates.  This composites everything the user sees — game content
+     * plus any overlay windows — into a single frame, exactly matching what a
+     * screenshot would show.
+     *
      * <p>Initialization steps:
      * <ol>
      *   <li>Calls {@code FindWindow(null, windowTitle)} to locate the HWND.</li>
      *   <li>Reads the initial window bounds via {@code GetWindowRect}.</li>
+     *   <li>Opens the desktop DC via {@code GetDC(null)}.</li>
      *   <li>Allocates the GDI pipeline and native pixel buffer sized to those
      *       bounds.</li>
      * </ol>
@@ -195,14 +205,14 @@ public final class NativeCaptureEngine implements AutoCloseable {
         //  ZERO-ALLOCATION HOT PATH — no new objects from here to return
         // ══════════════════════════════════════════════════════════════════════
 
-        // ── 3. BitBlt: GPU/driver-level copy from window DC → memory DC ───────
-        //    SRCCOPY transfers the pixel block at OS level; no Java objects cross
-        //    the boundary.  Note: minimised or fully occluded windows may return
-        //    false here, in which case pixelBuffer retains its previous content.
+        // ── 3. BitBlt: GPU/driver-level copy from desktop DC → memory DC ──────
+        //    Source origin is the game window's current screen position so we
+        //    capture exactly the screen region the game occupies — including any
+        //    overlay windows (Alt1, etc.) composited on top by the window manager.
         if (!GDI32.BitBlt(memDC, 0, 0, captureWidth, captureHeight,
-                          windowDC, 0, 0, EdokitGdi32.SRCCOPY)) {
+                          windowDC, windowRect.left, windowRect.top, EdokitGdi32.SRCCOPY)) {
             throw new IllegalStateException(
-                    "BitBlt failed — the window may be minimised or GPU-exclusive. "
+                    "BitBlt from desktop DC failed — the window may be minimised. "
                     + "Ensure the game is in windowed or borderless-windowed mode.");
         }
 
@@ -312,10 +322,14 @@ public final class NativeCaptureEngine implements AutoCloseable {
         captureWidth  = width;
         captureHeight = height;
 
-        // Obtain the window's display surface.
-        windowDC = USER32.GetDC(hwnd);
+        // Obtain the DESKTOP display surface (GetDC(null)) rather than the game
+        // window's own DC.  This gives us a composite view of the full screen at
+        // the game window's coordinates, which includes Alt1's transparent overlay
+        // window rendered on top.  Using the game-window DC alone would skip any
+        // overlay content drawn by other processes.
+        windowDC = USER32.GetDC(null);
         if (windowDC == null) {
-            throw new IllegalStateException("GetDC returned null — unable to access window surface.");
+            throw new IllegalStateException("GetDC(desktop) returned null — unable to access screen surface.");
         }
 
         // Create an off-screen memory DC compatible with the window's colour depth.
@@ -391,10 +405,11 @@ public final class NativeCaptureEngine implements AutoCloseable {
             memDC = null;
         }
 
-        // Step 4: Return the shared window DC to the system pool.
+        // Step 4: Return the desktop DC to the system pool.
+        //         Must use null HWND since that is what was passed to GetDC().
         //         Failure to release this leaks one of Windows' finite DC slots.
         if (windowDC != null) {
-            USER32.ReleaseDC(hwnd, windowDC);
+            USER32.ReleaseDC(null, windowDC);
             windowDC = null;
         }
 
