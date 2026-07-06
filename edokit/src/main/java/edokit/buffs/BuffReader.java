@@ -390,16 +390,39 @@ public final class BuffReader {
         for (int i = 0; i < activeSlots.size(); i++) {
             final Rectangle slot = activeSlots.get(i);
 
-            // ── Step A: OCR the countdown timer along the bottom half of the icon ──
+            // ── Step A: OCR the countdown timer ──────────────────────────────────
+            // RS3 renders the timer as pixel text at the BOTTOM of each buff icon.
+            // The timer font (pixel_8px_digits) has a tight content height of 8 px.
+            // We scan a ±3 px window around the expected bottom position so a
+            // 1–2 row rendering offset doesn't cause a miss.
+            //
+            // Expected position: slot.bottom - font.height
+            //   = slot.y + 27 - 8 = slot.y + 19
+            //
+            // Why the previous slot.y + 13 was wrong: that reads from mid-slot
+            // where the buff icon texture lives, not where the timer text is.
             final int ocrX = slot.x;
-            final int ocrY = slot.y + (slot.height / 2);
             String timerText = "";
+            int    timerY    = -1;
             if (timerFont != null) {
-                timerText = ocr.readLine(screenFrame, ocrX, ocrY, timerFont);
+                final int fontH   = timerFont.fontDef().height();      // typically 8
+                final int yCenter = slot.y + slot.height - fontH;      // slot.y + 19
+                final int yStart  = Math.max(0, yCenter - 3);
+                final int yEnd    = Math.min(screenFrame.height - fontH, yCenter + 3);
 
-                // ── Step B: mask the recognised digits out of the live frame ───────
+                for (int ty = yStart; ty <= yEnd; ty++) {
+                    final String candidate = ocr.readLine(screenFrame, ocrX, ty, timerFont);
+                    if (!candidate.isEmpty()) {
+                        timerText = candidate;
+                        timerY    = ty;
+                        break;
+                    }
+                }
+
                 if (!timerText.isEmpty()) {
-                    ocr.removeTextPixels(screenFrame, ocrX, ocrY, timerText, timerFont);
+                    // ── Step B: mask recognised timer digits so they don't
+                    //    interfere with the colour-fingerprint match below. ───────
+                    ocr.removeTextPixels(screenFrame, ocrX, timerY, timerText, timerFont);
                 }
             }
 
