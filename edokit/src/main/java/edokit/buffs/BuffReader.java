@@ -107,8 +107,15 @@ public final class BuffReader {
      */
     private static final int MIN_BORDER_SAMPLES_REQUIRED = 6;
 
-    /** Consecutive empty columns in a row before that row's horizontal scan stops. */
-    private static final int MAX_EMPTY_COLS_BEFORE_ROW_STOP = 1;
+    /**
+     * How many consecutive empty columns are allowed before the horizontal scan
+     * of a row stops.  RS3's buff bar is always filled contiguously — there are
+     * never gaps between active buff slots — so the only correct value is 0
+     * (stop at the very first empty position).  A value of 1+ would carry
+     * the scan past a gap and risk picking up a false-positive slot from
+     * unrelated UI elements that happen to share the border colour.
+     */
+    private static final int MAX_EMPTY_COLS_BEFORE_ROW_STOP = 0;
 
     /**
      * Whether the one-time anchor diagnostic has already been printed.
@@ -301,19 +308,30 @@ public final class BuffReader {
             return false;
         }
 
-        final int e = BUFF_SIZE - 1; // last pixel index within the cell (= 26)
+        final int e = BUFF_SIZE - 1; // 26
+        final int m = e / 2;         // 13 — mid-edge index
 
-        // 8-point sample: top-left corner, top-right corner, bottom-left corner,
-        // mid-points on top and left edges, plus second-row/col positions.
+        // ── Interior guard ────────────────────────────────────────────────────
+        // A real buff slot's interior contains the icon texture (dark blues,
+        // purples, reds …) — never the olive-green border colour.  If the centre
+        // pixel matches the border colour, we have hit a large green game-terrain
+        // element or a solid-colour UI panel, not a buff slot.
+        if (isBuffBorderColor(screen, x + m, y + m)) return false;
+
+        // ── 8-point border ring: one sample per corner and mid-edge ──────────
+        // Previous code only sampled the top and left edges, making it easy for
+        // game terrain (grass strips, tree canopies) to accumulate 6 matches on
+        // those two edges alone.  A balanced ring forces the candidate to look
+        // like a closed rectangular frame on all four sides.
         int borderCount = 0;
-        if (isBuffBorderColor(screen, x,         y        )) borderCount++; // top-left
-        if (isBuffBorderColor(screen, x + e,     y        )) borderCount++; // top-right
-        if (isBuffBorderColor(screen, x,         y + e    )) borderCount++; // bottom-left
-        if (isBuffBorderColor(screen, x + e / 2, y        )) borderCount++; // top mid
-        if (isBuffBorderColor(screen, x,         y + e / 2)) borderCount++; // left mid
-        if (isBuffBorderColor(screen, x + 1,     y        )) borderCount++; // top-left row-2
-        if (isBuffBorderColor(screen, x,         y + 1    )) borderCount++; // top-left col-2
-        if (isBuffBorderColor(screen, x + e / 2, y + 1    )) borderCount++; // top mid row-2
+        if (isBuffBorderColor(screen, x,     y    )) borderCount++; // TL corner
+        if (isBuffBorderColor(screen, x + m, y    )) borderCount++; // top  mid
+        if (isBuffBorderColor(screen, x + e, y    )) borderCount++; // TR corner
+        if (isBuffBorderColor(screen, x + e, y + m)) borderCount++; // right mid
+        if (isBuffBorderColor(screen, x + e, y + e)) borderCount++; // BR corner
+        if (isBuffBorderColor(screen, x + m, y + e)) borderCount++; // bottom mid
+        if (isBuffBorderColor(screen, x,     y + e)) borderCount++; // BL corner
+        if (isBuffBorderColor(screen, x,     y + m)) borderCount++; // left  mid
 
         return borderCount >= MIN_BORDER_SAMPLES_REQUIRED;
     }
@@ -416,31 +434,32 @@ public final class BuffReader {
             final int ocrX = slot.x;
             String timerText = "";
             int    timerY    = -1;
-            if (timerFont != null) {
-                final int fontH      = timerFont.fontDef().height();   // typically 8
-                final int bottomPad  = 4;                              // gap below text
-                final int yCenter    = slot.y + slot.height - fontH - bottomPad; // slot.y+15
-                final int yStart     = Math.max(0, yCenter - 4);
-                final int yEnd       = Math.min(screenFrame.height - fontH, yCenter + 4);
 
-                // ── Diagnostic: log slot position + pixel colours once per boot ──
-                if (i == 0 && ocrDiagnosticPending) {
-                    ocrDiagnosticPending = false;
+            // ── One-time diagnostic (always fires regardless of font load) ────────
+            if (i == 0 && ocrDiagnosticPending) {
+                ocrDiagnosticPending = false;
+                System.out.printf("[Edokit OCR] --- One-time diagnostic ---%n");
+                System.out.printf("[Edokit OCR] timerFont=%s%n", timerFont);
+                for (int si = 0; si < activeSlots.size(); si++) {
+                    final Rectangle s = activeSlots.get(si);
+                    final int fontH0  = (timerFont != null) ? timerFont.fontDef().height() : 8;
+                    final int sc = s.y + s.height - fontH0 - 4;
                     System.out.printf(
-                            "[Edokit OCR] --- One-time slot / pixel diagnostic ---%n");
-                    for (int si = 0; si < activeSlots.size(); si++) {
-                        final Rectangle s = activeSlots.get(si);
-                        final int sc = s.y + s.height - fontH - bottomPad;
-                        System.out.printf(
-                                "[Edokit OCR] Slot %d → screen (%d,%d) size %dx%d | "
-                                + "timer scan rows y=%d..%d%n",
-                                si, s.x, s.y, s.width, s.height,
-                                Math.max(0, sc - 4),
-                                Math.min(screenFrame.height - fontH, sc + 4));
-                    }
-                    // Dump the brightest pixel in each scanned row for first slot
-                    System.out.printf("[Edokit OCR] Slot 0 timer-row pixel scan:%n");
-                    for (int ty2 = yStart; ty2 <= yEnd; ty2++) {
+                            "[Edokit OCR] Slot %d → screen (%d,%d) size %dx%d | "
+                            + "yCenter=%d scan y=%d..%d%n",
+                            si, s.x, s.y, s.width, s.height,
+                            sc,
+                            Math.max(0, sc - 4),
+                            Math.min(screenFrame.height - fontH0, sc + 4));
+                }
+                if (timerFont != null) {
+                    final int fontH0  = timerFont.fontDef().height();
+                    final int yC0     = slot.y + slot.height - fontH0 - 4;
+                    final int yS0     = Math.max(0, yC0 - 4);
+                    final int yE0     = Math.min(screenFrame.height - fontH0, yC0 + 4);
+                    System.out.printf("[Edokit OCR] Slot 0 timer-row pixel scan (yStart=%d yEnd=%d):%n",
+                            yS0, yE0);
+                    for (int ty2 = yS0; ty2 <= yE0; ty2++) {
                         int maxBr = 0; int br = 0, bg = 0, bb = 0;
                         for (int tx = ocrX;
                              tx < ocrX + slot.width && tx < screenFrame.width; tx++) {
@@ -452,11 +471,21 @@ public final class BuffReader {
                                 maxBr = r2 + g2 + b2; br = r2; bg = g2; bb = b2;
                             }
                         }
+                        final String ocr0 = ocr.readLine(screenFrame, ocrX, ty2, timerFont);
                         System.out.printf(
-                                "[Edokit OCR]   y=%d brightest=(%3d,%3d,%3d) sum=%d%n",
-                                ty2, br, bg, bb, maxBr);
+                                "[Edokit OCR]   y=%d brightest=(%3d,%3d,%3d) sum=%d ocr=%s%n",
+                                ty2, br, bg, bb, maxBr,
+                                ocr0.isEmpty() ? "(no match)" : "\"" + ocr0 + "\"");
                     }
                 }
+            }
+
+            if (timerFont != null) {
+                final int fontH      = timerFont.fontDef().height();   // typically 8
+                final int bottomPad  = 4;                              // gap below text
+                final int yCenter    = slot.y + slot.height - fontH - bottomPad; // slot.y+15
+                final int yStart     = Math.max(0, yCenter - 4);
+                final int yEnd       = Math.min(screenFrame.height - fontH, yCenter + 4);
 
                 for (int ty = yStart; ty <= yEnd; ty++) {
                     final String candidate = ocr.readLine(screenFrame, ocrX, ty, timerFont);
