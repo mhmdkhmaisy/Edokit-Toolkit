@@ -210,7 +210,8 @@ public final class NativeCaptureEngine implements AutoCloseable {
         //    capture exactly the screen region the game occupies — including any
         //    overlay windows (Alt1, etc.) composited on top by the window manager.
         if (!GDI32.BitBlt(memDC, 0, 0, captureWidth, captureHeight,
-                          windowDC, windowRect.left, windowRect.top, EdokitGdi32.SRCCOPY)) {
+                          windowDC, windowRect.left, windowRect.top,
+                          EdokitGdi32.SRCCOPY | EdokitGdi32.CAPTUREBLT)) {
             throw new IllegalStateException(
                     "BitBlt from desktop DC failed — the window may be minimised. "
                     + "Ensure the game is in windowed or borderless-windowed mode.");

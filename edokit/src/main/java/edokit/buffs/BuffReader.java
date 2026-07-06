@@ -116,6 +116,13 @@ public final class BuffReader {
      */
     private volatile boolean anchorDiagnosticPrinted = false;
 
+    /**
+     * Whether the one-time OCR slot / pixel diagnostic should still be printed.
+     * Set to {@code false} after the first {@link #readBuffBar} call that has
+     * at least one slot, so the console isn't flooded on every frame.
+     */
+    private boolean ocrDiagnosticPending = true;
+
     // =========================================================================
     // Internal state
     // =========================================================================
@@ -409,6 +416,41 @@ public final class BuffReader {
                 final int yCenter = slot.y + slot.height - fontH;      // slot.y + 19
                 final int yStart  = Math.max(0, yCenter - 3);
                 final int yEnd    = Math.min(screenFrame.height - fontH, yCenter + 3);
+
+                // ── Diagnostic: log slot position + pixel colours once per boot ──
+                if (i == 0 && ocrDiagnosticPending) {
+                    ocrDiagnosticPending = false;
+                    System.out.printf(
+                            "[Edokit OCR] --- One-time slot / pixel diagnostic ---%n");
+                    for (int si = 0; si < activeSlots.size(); si++) {
+                        final Rectangle s = activeSlots.get(si);
+                        System.out.printf(
+                                "[Edokit OCR] Slot %d → screen (%d,%d) size %dx%d | "
+                                + "timer scan rows y=%d..%d%n",
+                                si, s.x, s.y, s.width, s.height,
+                                Math.max(0, s.y + s.height - fontH - 3),
+                                Math.min(screenFrame.height - fontH,
+                                         s.y + s.height - fontH + 3));
+                    }
+                    // Dump the brightest pixel in each scanned row for first slot
+                    System.out.printf("[Edokit OCR] Slot 0 timer-row pixel scan:%n");
+                    for (int ty2 = yStart; ty2 <= yEnd; ty2++) {
+                        int maxBr = 0; int br = 0, bg = 0, bb = 0;
+                        for (int tx = ocrX;
+                             tx < ocrX + slot.width && tx < screenFrame.width; tx++) {
+                            final int off = (tx + ty2 * screenFrame.width) * 4;
+                            final int r2 = screenFrame.data[off]     & 0xFF;
+                            final int g2 = screenFrame.data[off + 1] & 0xFF;
+                            final int b2 = screenFrame.data[off + 2] & 0xFF;
+                            if (r2 + g2 + b2 > maxBr) {
+                                maxBr = r2 + g2 + b2; br = r2; bg = g2; bb = b2;
+                            }
+                        }
+                        System.out.printf(
+                                "[Edokit OCR]   y=%d brightest=(%3d,%3d,%3d) sum=%d%n",
+                                ty2, br, bg, bb, maxBr);
+                    }
+                }
 
                 for (int ty = yStart; ty <= yEnd; ty++) {
                     final String candidate = ocr.readLine(screenFrame, ocrX, ty, timerFont);

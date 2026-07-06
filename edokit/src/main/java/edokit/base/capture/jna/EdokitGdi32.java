@@ -69,6 +69,20 @@ public interface EdokitGdi32 extends StdCallLibrary {
      */
     int SRCCOPY = 0x00CC0020;
 
+    /**
+     * {@code CAPTUREBLT} (0x40000000) — when OR'd with a raster-operation code,
+     * instructs {@code BitBlt} to include the content of any layered windows
+     * that lie on top of the source DC in the resulting image.
+     *
+     * <p>Without this flag, hardware-accelerated or WS_EX_LAYERED windows
+     * (including Electron/Chromium overlays such as Alt1 Toolkit) are NOT
+     * composited into the copy — only GDI-rendered pixels are captured.
+     *
+     * <p>Use as {@code SRCCOPY | CAPTUREBLT} on the {@link #BitBlt} rasterOp
+     * argument to capture the full composited desktop including Alt1 overlays.
+     */
+    int CAPTUREBLT = 0x40000000;
+
     // =========================================================================
     // GetDIBits usage constant
     // =========================================================================
