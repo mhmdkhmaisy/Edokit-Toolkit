@@ -403,19 +403,25 @@ public final class BuffReader {
             // We scan a ±3 px window around the expected bottom position so a
             // 1–2 row rendering offset doesn't cause a miss.
             //
-            // Expected position: slot.bottom - font.height
-            //   = slot.y + 27 - 8 = slot.y + 19
+            // Expected position: pixel analysis of a live capture with CAPTUREBLT
+            // shows Alt1's timer text starting at slot.y + 15 (not slot.y + 19).
             //
-            // Why the previous slot.y + 13 was wrong: that reads from mid-slot
-            // where the buff icon texture lives, not where the timer text is.
+            // Derivation:
+            //   slot.height = 27 (includes 1px border top + 25px interior + 1px border bottom)
+            //   fontH       =  8 (pixel_8px_digits tight content height)
+            //   bottom pad  =  4 (Alt1 leaves 4px below the text inside the icon)
+            //   yCenter = slot.y + slot.height - fontH - bottomPad = slot.y + 15
+            //
+            // A ±4 window around this centre tolerates minor per-resolution shifts.
             final int ocrX = slot.x;
             String timerText = "";
             int    timerY    = -1;
             if (timerFont != null) {
-                final int fontH   = timerFont.fontDef().height();      // typically 8
-                final int yCenter = slot.y + slot.height - fontH;      // slot.y + 19
-                final int yStart  = Math.max(0, yCenter - 3);
-                final int yEnd    = Math.min(screenFrame.height - fontH, yCenter + 3);
+                final int fontH      = timerFont.fontDef().height();   // typically 8
+                final int bottomPad  = 4;                              // gap below text
+                final int yCenter    = slot.y + slot.height - fontH - bottomPad; // slot.y+15
+                final int yStart     = Math.max(0, yCenter - 4);
+                final int yEnd       = Math.min(screenFrame.height - fontH, yCenter + 4);
 
                 // ── Diagnostic: log slot position + pixel colours once per boot ──
                 if (i == 0 && ocrDiagnosticPending) {
@@ -424,13 +430,13 @@ public final class BuffReader {
                             "[Edokit OCR] --- One-time slot / pixel diagnostic ---%n");
                     for (int si = 0; si < activeSlots.size(); si++) {
                         final Rectangle s = activeSlots.get(si);
+                        final int sc = s.y + s.height - fontH - bottomPad;
                         System.out.printf(
                                 "[Edokit OCR] Slot %d → screen (%d,%d) size %dx%d | "
                                 + "timer scan rows y=%d..%d%n",
                                 si, s.x, s.y, s.width, s.height,
-                                Math.max(0, s.y + s.height - fontH - 3),
-                                Math.min(screenFrame.height - fontH,
-                                         s.y + s.height - fontH + 3));
+                                Math.max(0, sc - 4),
+                                Math.min(screenFrame.height - fontH, sc + 4));
                     }
                     // Dump the brightest pixel in each scanned row for first slot
                     System.out.printf("[Edokit OCR] Slot 0 timer-row pixel scan:%n");
